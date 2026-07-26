@@ -3,6 +3,7 @@
 
 mod autostart;
 mod backend;
+mod branding;
 mod i18n;
 mod launcher_control;
 mod notify;
@@ -1328,6 +1329,7 @@ fn main() -> Result<()> {
                             ));
                             return;
                         }
+                        branding::apply_app_branding();
                         info!("Starting gui.py on http://127.0.0.1:{}/", port);
                         status_updater(
                             SplashUpdate::loading(

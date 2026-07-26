@@ -12,6 +12,14 @@ self-update for this personal build. AzurPilot repository and dependency
 updates still run normally. Rebuild this branch manually when adopting a new
 launcher release so a cloud binary cannot silently replace the personal icon.
 
+The files in `branding/alas-app/` are embedded into the launcher and copied
+to `assets/gui/icon/` after the AzurPilot repository update completes and
+before `gui.py` starts. This keeps the WebUI avatar and status icons
+independent from the main repository source.
+
+Only allowlisted static icon paths are copied. Missing targets produce a
+warning and do not prevent the scheduler from starting.
+
 Build the Windows release from this branch with:
 
 ```powershell
