@@ -248,6 +248,7 @@ fn kill_processes_using_port(port: u16) -> Result<()> {
     }
 
     let current_pid = std::process::id();
+    let repo_dir = alas_repo_dir().canonicalize()?;
     let sys = sysinfo::System::new_all();
     for pid in pids {
         if pid == 0 || pid == current_pid {
@@ -257,6 +258,19 @@ fn kill_processes_using_port(port: u16) -> Result<()> {
         let sys_pid = sysinfo::Pid::from_u32(pid);
         match sys.process(sys_pid) {
             Some(process) => {
+                // 只结束运行目录内的进程，端口被无关程序占用时拒绝启动而不是误杀
+                let belongs_to_runtime = process
+                    .exe()
+                    .and_then(|exe| exe.canonicalize().ok())
+                    .is_some_and(|exe| exe.starts_with(&repo_dir));
+                if !belongs_to_runtime {
+                    return Err(anyhow!(
+                        "Configured WebUI port {} is already used by unrelated process {} ({}); refusing to terminate it",
+                        port,
+                        pid,
+                        process.name().to_string_lossy(),
+                    ));
+                }
                 info!(
                     "Killing process {} ({}) using configured WebUI port {}",
                     pid,
