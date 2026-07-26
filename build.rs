@@ -8,7 +8,32 @@ const LAUNCHER_UPDATE_URL_ENV: &str = "LAUNCHER_UPDATE_URL";
 const DEFAULT_LAUNCHER_UPDATE_URL: &str =
     "https://ap.launcher-update.nanoda.work/updata/stable.json";
 
+fn sync_branding_assets(manifest_dir: &std::path::Path) {
+    let branding_dir = manifest_dir.join("branding/alas");
+    let icons_dir = manifest_dir.join("icons");
+    for name in ["icon.png", "icon.ico", "icon.icns"] {
+        let source = branding_dir.join(name);
+        let target = icons_dir.join(name);
+        if source.exists() {
+            let needs_copy = fs::read(&source).ok() != fs::read(&target).ok();
+            if needs_copy {
+                fs::copy(&source, &target).unwrap_or_else(|error| {
+                    panic!(
+                        "failed to apply ALAS branding asset {} -> {}: {error}",
+                        source.display(),
+                        target.display()
+                    )
+                });
+            }
+            println!("cargo:rerun-if-changed={}", source.display());
+        }
+    }
+}
+
 fn main() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    sync_branding_assets(&manifest_dir);
+
     let execution_level = if env::var("PROFILE").as_deref() == Ok("release") {
         "requireAdministrator"
     } else {
