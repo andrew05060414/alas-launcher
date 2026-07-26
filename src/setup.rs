@@ -79,7 +79,7 @@ struct GitProgressState {
     progress: u8,
 }
 
-const MAX_UPDATE_RETRIES: usize = 20;
+const MAX_UPDATE_RETRIES: usize = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const CLEANUP_RETRIES: usize = 20;
 const PYTHON_VERSION: &str = "3.14.3";
@@ -361,148 +361,6 @@ pub fn get_deploy_config() -> Option<JsonValue> {
     Some(config)
 }
 
-pub fn cleanup_runtime_for_rebuild() -> Result<()> {
-    let repo_dir = alas_repo_dir();
-    let current_exe = std::env::current_exe()?;
-    let current_exe_name = current_exe
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("alas-launcher.exe")
-        .to_ascii_lowercase();
-    let repo_dir = repo_dir.canonicalize()?;
-    let exe_dir = current_exe
-        .parent()
-        .ok_or_else(|| anyhow!(t!("errors.launcher_dir_not_found")))?
-        .canonicalize()?;
-    if !cleanup_target_belongs_to_launcher(&repo_dir, &exe_dir) {
-        bail!(t!(
-            "errors.refuse_cleanup",
-            actual = repo_dir.display().to_string(),
-            expected = exe_dir.display().to_string()
-        ));
-    }
-
-    kill_runtime_processes(&repo_dir);
-    clean_uv_cache()?;
-
-    let mut failures = Vec::new();
-    for entry in fs::read_dir(&repo_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if should_keep_runtime_entry(&path, &current_exe_name) {
-            info!("Keeping {}", path.display());
-            continue;
-        }
-
-        info!("Removing {}", path.display());
-        if let Err(err) = remove_runtime_entry_with_retry(&path) {
-            failures.push(format!("{}: {err:#}", path.display()));
-        }
-    }
-
-    if !failures.is_empty() {
-        bail!(t!(
-            "errors.partial_cleanup_failed",
-            errors = failures.join("\n")
-        ));
-    }
-
-    Ok(())
-}
-
-fn clean_uv_cache() -> Result<()> {
-    let uv = bootstrap_uv_path()?;
-    info!("Cleaning uv cache with {}", uv.display());
-    let status = Command::new(&uv)
-        .args(["cache", "clean"])
-        .env("UV_NO_PROGRESS", "1")
-        .env_remove("UV_PYTHON")
-        .create_no_window()
-        .status()
-        .with_context(|| {
-            t!(
-                "errors.uv_cache_cleanup_failed",
-                error = uv.display().to_string()
-            )
-        })?;
-    if !status.success() {
-        bail!(t!("errors.uv_cache_failed"));
-    }
-    Ok(())
-}
-
-fn kill_runtime_processes(repo_dir: &Path) {
-    let current_pid = std::process::id();
-    let sys = sysinfo::System::new_all();
-    for (pid, process) in sys.processes() {
-        if pid.as_u32() == current_pid {
-            continue;
-        }
-
-        let should_kill = process
-            .exe()
-            .map(|exe| path_is_inside(exe, repo_dir))
-            .unwrap_or(false)
-            || process
-                .cwd()
-                .map(|cwd| path_is_inside(cwd, repo_dir))
-                .unwrap_or(false);
-
-        if should_kill {
-            info!(
-                "Killing runtime process {} ({}) before cleanup",
-                pid,
-                process.name().to_string_lossy()
-            );
-            if !process.kill() {
-                warn!("Failed to kill runtime process {}", pid);
-            }
-        }
-    }
-
-    thread::sleep(Duration::from_millis(500));
-}
-
-fn path_is_inside(path: &Path, parent: &Path) -> bool {
-    path.canonicalize()
-        .map(|path| path.starts_with(parent))
-        .unwrap_or(false)
-}
-
-fn cleanup_target_belongs_to_launcher(repo_dir: &Path, exe_dir: &Path) -> bool {
-    if repo_dir == exe_dir {
-        return true;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let Some(contents_dir) = exe_dir.parent() else {
-            return false;
-        };
-        let expected_repo_dir = contents_dir.join("AzurLaneAutoScript");
-        return exe_dir.file_name() == Some(std::ffi::OsStr::new("MacOS"))
-            && repo_dir == expected_repo_dir;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-}
-
-fn should_keep_runtime_entry(path: &Path, current_exe_name: &str) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return true;
-    };
-    let name = name.to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "deploy" | "log" | "config" | "bootstrap" | "unins000.dat" | "unins000.exe"
-    ) || (cfg!(target_os = "macos") && name == ".venv")
-        || name == "alas-launcher.exe"
-        || name == current_exe_name
-}
-
 fn remove_runtime_entry(path: &Path) -> Result<()> {
     clear_readonly(path)?;
     if path.is_dir() {
@@ -717,7 +575,7 @@ fn run_command_with_retry(
         ) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                if retry == MAX_UPDATE_RETRIES {
+                if retry == MAX_UPDATE_RETRIES || !should_retry_command_error(phase, &err) {
                     return Err(err);
                 }
 
@@ -734,6 +592,23 @@ fn run_command_with_retry(
     }
 
     unreachable!()
+}
+
+fn should_retry_command_error(phase: ScriptPhase, error: &anyhow::Error) -> bool {
+    if !matches!(phase, ScriptPhase::Git) {
+        return true;
+    }
+
+    let error = error.to_string().to_ascii_lowercase();
+    ![
+        "unable to unlink",
+        "could not reset index file",
+        "permission denied",
+        "access is denied",
+        "invalid argument",
+    ]
+    .iter()
+    .any(|message| error.contains(message))
 }
 
 fn run_status_command(
@@ -849,7 +724,6 @@ fn uv_sync_project(
         }
 
         info!("Syncing dependencies with PyPI index: {index}");
-        remove_uv_lock_for_resolve()?;
         let mut cmd = uv_sync_command(&bootstrap_uv, index);
 
         match run_command(
@@ -897,17 +771,6 @@ fn uv_sync_command_with_paths(
     uv_python_env_with_install_dir(&mut cmd, python_install_dir);
     ignore_uv_index_env(&mut cmd);
     cmd
-}
-
-fn remove_uv_lock_for_resolve() -> Result<()> {
-    let lock_path = Path::new("uv.lock");
-    if !lock_path.exists() {
-        return Ok(());
-    }
-    clear_readonly(lock_path)?;
-    fs::remove_file(lock_path).context("Failed to remove uv.lock before dependency resolution")?;
-    info!("Removed uv.lock so uv can regenerate dependency artifact URLs");
-    Ok(())
 }
 
 fn migrate_dependency_config() -> Result<()> {
@@ -1918,5 +1781,28 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(key, value)| key == "UV_PYTHON" && value.is_none()));
+    }
+
+    #[test]
+    fn test_git_file_errors_are_not_retried() {
+        for message in [
+            "error: unable to unlink old 'webapp/app.asar': Invalid argument",
+            "fatal: Could not reset index file to revision 'origin/master'.",
+            "Permission denied",
+            "Access is denied",
+        ] {
+            assert!(!should_retry_command_error(
+                ScriptPhase::Git,
+                &anyhow!(message)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_transient_git_errors_can_retry() {
+        assert!(should_retry_command_error(
+            ScriptPhase::Git,
+            &anyhow!("Failed to connect to github.com")
+        ));
     }
 }
