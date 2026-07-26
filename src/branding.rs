@@ -27,32 +27,32 @@ const APP_BRANDING_ASSETS: &[AppBrandingAsset] = &[
     AppBrandingAsset {
         target: "assets/gui/icon/develop.svg",
         data: include_bytes!("../branding/alas-app/develop.svg"),
-        sha256: "ff860932fce9a82614ba6bb5fce53cf4dd9d4b410280650e42a19248adaf1e36",
+        sha256: "6a70ac25bfd505a6df3996eeade6208a40cb581add9bb060c0d55f165141b840",
     },
     AppBrandingAsset {
         target: "assets/gui/icon/run.svg",
         data: include_bytes!("../branding/alas-app/run.svg"),
-        sha256: "6a17b1b9746dd8be8f444e1c23ebab4d701aab357d02c22f70c72b0392642037",
+        sha256: "d51d6789a1837e8aab350ce7880854dd55ef0b965dace5025fdf7a1ccde51426",
     },
     AppBrandingAsset {
         target: "assets/gui/icon/setting.svg",
         data: include_bytes!("../branding/alas-app/setting.svg"),
-        sha256: "d51d6789a1837e8aab350ce7880854dd55ef0b965dace5025fdf7a1ccde51426",
+        sha256: "06a17b1b9746dd8be8f444e1c23ebab4d701aab357d02c22f70c72b0392642037",
     },
     AppBrandingAsset {
         target: "assets/gui/icon/status_error.svg",
         data: include_bytes!("../branding/alas-app/status_error.svg"),
-        sha256: "2e6079af85a1344fff21407a8f7b40a25c3d5950ed2b0e62cbf982e40222992c",
+        sha256: "eb68374b1e1e1dd0fdade890d13435515a888bd7216d8d09055b7c56967bc7a4",
     },
     AppBrandingAsset {
         target: "assets/gui/icon/status_running.svg",
         data: include_bytes!("../branding/alas-app/status_running.svg"),
-        sha256: "eb68374b1e1e1dd0fdade890d13435515a888bd7216d8d09055b7c56967bc7a4",
+        sha256: "2e6079af85a1344fff21407a8f7b40a25c3d5950ed2b0e62cbf982e40222992c",
     },
     AppBrandingAsset {
         target: "assets/gui/icon/status_update.svg",
         data: include_bytes!("../branding/alas-app/status_update.svg"),
-        sha256: "eb28ee7b2eb2fa167d5cbecf90ef4959ef02bd28160b0b37896ca1004a19328c",
+        sha256: "ff860932fce9a82614ba6bb5fce53cf4dd9d4b410280650e42a19248adaf1e36",
     },
 ];
 
