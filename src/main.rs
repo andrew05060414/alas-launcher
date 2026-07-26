@@ -81,6 +81,8 @@ const TIME_BOMB_CONFIG_SOURCE: &str = include_str!("../Cargo.toml");
 #[cfg(test)]
 const TAURI_CONFIG_SOURCE: &str = include_str!("../tauri.conf.json");
 const LAUNCHER_UPDATE_URL: &str = env!("LAUNCHER_UPDATE_URL");
+const LAUNCHER_SELF_UPDATE_DISABLED: bool =
+    option_env!("ALAS_LAUNCHER_DISABLE_SELF_UPDATE").is_some();
 const LAUNCHER_UPDATE_SKIP_ENV: &str = "AZURPILOT_SKIP_LAUNCHER_UPDATE";
 const MINI_LAUNCHER_VERSION: &str = "0.0.1";
 const LAUNCHER_UPDATE_MTLS_IDENTITY: &[u8] =
@@ -315,6 +317,11 @@ fn launcher_version_is_mini(version: &str) -> bool {
 }
 
 fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate)) -> Result<bool> {
+    if LAUNCHER_SELF_UPDATE_DISABLED {
+        info!("Launcher self-update is disabled for this personal build");
+        return Ok(false);
+    }
+
     if std::env::var_os(LAUNCHER_UPDATE_SKIP_ENV).is_some() {
         info!("Skipping launcher update check after restart");
         std::env::remove_var(LAUNCHER_UPDATE_SKIP_ENV);

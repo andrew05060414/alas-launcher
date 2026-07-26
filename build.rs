@@ -8,13 +8,15 @@ const LAUNCHER_UPDATE_URL_ENV: &str = "LAUNCHER_UPDATE_URL";
 const DEFAULT_LAUNCHER_UPDATE_URL: &str =
     "https://ap.launcher-update.nanoda.work/updata/stable.json";
 
-fn sync_branding_assets(manifest_dir: &std::path::Path) {
+fn sync_branding_assets(manifest_dir: &std::path::Path) -> bool {
     let branding_dir = manifest_dir.join("branding/alas");
     let icons_dir = manifest_dir.join("icons");
+    let mut personal_branding_present = false;
     for name in ["icon.png", "icon.ico", "icon.icns"] {
         let source = branding_dir.join(name);
         let target = icons_dir.join(name);
         if source.exists() {
+            personal_branding_present = true;
             let needs_copy = fs::read(&source).ok() != fs::read(&target).ok();
             if needs_copy {
                 fs::copy(&source, &target).unwrap_or_else(|error| {
@@ -28,11 +30,14 @@ fn sync_branding_assets(manifest_dir: &std::path::Path) {
             println!("cargo:rerun-if-changed={}", source.display());
         }
     }
+    personal_branding_present
 }
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    sync_branding_assets(&manifest_dir);
+    if sync_branding_assets(&manifest_dir) {
+        println!("cargo:rustc-env=ALAS_LAUNCHER_DISABLE_SELF_UPDATE=1");
+    }
 
     let execution_level = if env::var("PROFILE").as_deref() == Ok("release") {
         "requireAdministrator"
