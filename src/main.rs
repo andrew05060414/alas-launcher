@@ -938,26 +938,20 @@ mod tests {
         #[cfg(windows)]
         assert!(splash_html.contains("const webviewDraggableRegionsEnabled = true;"));
 
-        #[cfg(not(target_os = "macos"))]
-        let titlebar_script = main_window_titlebar_injection_script();
+        let config: serde_json::Value =
+            serde_json::from_str(TAURI_CONFIG_SOURCE).expect("valid config");
+        let windows = config["app"]["windows"].as_array().expect("window configs");
+        let main = windows
+            .iter()
+            .find(|window| window["label"] == "main")
+            .expect("main window config");
+        let splash = windows
+            .iter()
+            .find(|window| window["label"] == "splash")
+            .expect("splash window config");
 
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert!(titlebar_script.contains("touch-action:none"));
-            assert!(titlebar_script.contains("addEventListener('pointerdown'"));
-            assert!(titlebar_script.contains("-webkit-app-region:drag"));
-            assert!(titlebar_script.contains("-webkit-app-region:no-drag"));
-            assert!(titlebar_script.contains("webviewDraggableRegionsEnabled"));
-            assert!(titlebar_script.contains("if (webviewDraggableRegionsEnabled)"));
-            assert!(titlebar_script.contains("min-height:12px"));
-            assert!(titlebar_script.contains("alas-close-menu"));
-            assert!(!titlebar_script.contains("alas-close-optics"));
-            assert!(!titlebar_script.contains("alas-island-open"));
-            assert!(titlebar_script.contains("__ALAS_OPEN_CLOSE_PROMPT"));
-            assert!(titlebar_script.contains("window_exit_application"));
-            #[cfg(windows)]
-            assert!(titlebar_script.contains("const webviewDraggableRegionsEnabled = true;"));
-        }
+        assert_eq!(main["decorations"], serde_json::Value::Bool(true));
+        assert_eq!(splash["decorations"], serde_json::Value::Bool(false));
     }
 
     #[test]
@@ -1473,25 +1467,6 @@ fn main() -> Result<()> {
                         return;
                     }
 
-                    // Windows: show the in-window close chooser instead of a native dialog.
-                    #[cfg(windows)]
-                    {
-                        if label == "main" && !allow_exit.load(Ordering::SeqCst) {
-                            api.prevent_close();
-                            if let Some(main_window) = app_handle.get_webview_window("main") {
-                                if let Err(err) = main_window.eval(
-                                    "if (typeof window.__ALAS_OPEN_CLOSE_PROMPT !== 'function') { throw new Error('close prompt is unavailable'); } window.__ALAS_OPEN_CLOSE_PROMPT();",
-                                ) {
-                                    warn!("Unable to open close chooser: {err:?}");
-                                    minimize_main_window_to_tray(&app_handle);
-                                }
-                            } else {
-                                minimize_main_window_to_tray(&app_handle);
-                            }
-                            return;
-                        }
-                    }
-
                     // macOS: switch to Accessory policy so the app does not terminate
                     // when no Regular windows are visible.
                     #[cfg(target_os = "macos")]
@@ -1734,15 +1709,10 @@ if (!window.alas_launcher_injected) {
             };
             reader.readAsDataURL(blob);
         };
-__ALAS_TITLEBAR_SCRIPT__
     })();
 }
-"#
-        .replace(
-            "__ALAS_TITLEBAR_SCRIPT__",
-            &main_window_titlebar_injection_script(),
-        );
-        if let Err(e) = webview.eval(&injected_js) {
+"#;
+        if let Err(e) = webview.eval(injected_js) {
             error!("Failed to inject JS to webview: {:?}", e);
         }
     }
@@ -1948,7 +1918,6 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     let error_detail_json = to_string(error_detail).unwrap();
     let mi_sans_font_b64 = BASE64_STANDARD.encode(MI_SANS_FONT);
     let splash_video_b64 = BASE64_STANDARD.encode(SPLASH_BG_VIDEO);
-    let titlebar_script = main_window_titlebar_injection_script();
     let i18n = serde_json::json!({
         "title": t!("error_page.title"),
         "heading": t!("error_page.heading"),
@@ -2270,10 +2239,6 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     </div>
   </main>
   <script>
-    (function () {{
-{titlebar_script}
-    }})();
-
     const i18n = {i18n_json};
     const backendUrl = {backend_url_json};
     const errorDetail = {error_detail_json};
@@ -3021,13 +2986,6 @@ fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<WebviewWindow
         .build()?;
     main_window.set_resizable(true)?;
 
-    // Windows/Linux: remove native decorations for the main window as well.
-    // Splash is configured as borderless in tauri.conf.json.
-    #[cfg(not(target_os = "macos"))]
-    {
-        main_window.set_decorations(false)?;
-    }
-
     Ok(main_window)
 }
 
@@ -3135,6 +3093,8 @@ fn toggle_main_window_visibility(
     }
 }
 
+// 保留旧实现供历史对照；主窗口当前使用原生 Windows 标题栏，不再调用此函数。
+#[allow(dead_code)]
 fn main_window_titlebar_injection_script() -> String {
     #[cfg(target_os = "macos")]
     {
