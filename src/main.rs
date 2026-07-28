@@ -938,20 +938,27 @@ mod tests {
         #[cfg(windows)]
         assert!(splash_html.contains("const webviewDraggableRegionsEnabled = true;"));
 
-        let config: serde_json::Value =
-            serde_json::from_str(TAURI_CONFIG_SOURCE).expect("valid config");
-        let windows = config["app"]["windows"].as_array().expect("window configs");
-        let main = windows
-            .iter()
-            .find(|window| window["label"] == "main")
-            .expect("main window config");
-        let splash = windows
-            .iter()
-            .find(|window| window["label"] == "splash")
-            .expect("splash window config");
+        #[cfg(not(target_os = "macos"))]
+        let titlebar_script = main_window_titlebar_injection_script();
 
-        assert_eq!(main["decorations"], serde_json::Value::Bool(true));
-        assert_eq!(splash["decorations"], serde_json::Value::Bool(false));
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(titlebar_script.contains("touch-action:none"));
+            assert!(titlebar_script.contains("addEventListener('pointerdown'"));
+            assert!(titlebar_script.contains("-webkit-app-region:drag"));
+            assert!(titlebar_script.contains("-webkit-app-region:no-drag"));
+            assert!(titlebar_script.contains("webviewDraggableRegionsEnabled"));
+            assert!(titlebar_script.contains("if (webviewDraggableRegionsEnabled)"));
+            assert!(titlebar_script.contains("min-width:36px"));
+            assert!(titlebar_script.contains(".icon-close:hover{background:#d93025"));
+            assert!(titlebar_script.contains("alas-close-menu"));
+            assert!(!titlebar_script.contains("alas-close-optics"));
+            assert!(!titlebar_script.contains("alas-island-open"));
+            assert!(titlebar_script.contains("__ALAS_OPEN_CLOSE_PROMPT"));
+            assert!(titlebar_script.contains("window_exit_application"));
+            #[cfg(windows)]
+            assert!(titlebar_script.contains("const webviewDraggableRegionsEnabled = true;"));
+        }
     }
 
     #[test]
@@ -1467,6 +1474,25 @@ fn main() -> Result<()> {
                         return;
                     }
 
+                    // Windows: show the in-window close chooser instead of a native dialog.
+                    #[cfg(windows)]
+                    {
+                        if label == "main" && !allow_exit.load(Ordering::SeqCst) {
+                            api.prevent_close();
+                            if let Some(main_window) = app_handle.get_webview_window("main") {
+                                if let Err(err) = main_window.eval(
+                                    "if (typeof window.__ALAS_OPEN_CLOSE_PROMPT !== 'function') { throw new Error('close prompt is unavailable'); } window.__ALAS_OPEN_CLOSE_PROMPT();",
+                                ) {
+                                    warn!("Unable to open close chooser: {err:?}");
+                                    minimize_main_window_to_tray(&app_handle);
+                                }
+                            } else {
+                                minimize_main_window_to_tray(&app_handle);
+                            }
+                            return;
+                        }
+                    }
+
                     // macOS: switch to Accessory policy so the app does not terminate
                     // when no Regular windows are visible.
                     #[cfg(target_os = "macos")]
@@ -1709,10 +1735,15 @@ if (!window.alas_launcher_injected) {
             };
             reader.readAsDataURL(blob);
         };
+__ALAS_TITLEBAR_SCRIPT__
     })();
 }
-"#;
-        if let Err(e) = webview.eval(injected_js) {
+"#
+        .replace(
+            "__ALAS_TITLEBAR_SCRIPT__",
+            &main_window_titlebar_injection_script(),
+        );
+        if let Err(e) = webview.eval(&injected_js) {
             error!("Failed to inject JS to webview: {:?}", e);
         }
     }
@@ -1918,6 +1949,7 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     let error_detail_json = to_string(error_detail).unwrap();
     let mi_sans_font_b64 = BASE64_STANDARD.encode(MI_SANS_FONT);
     let splash_video_b64 = BASE64_STANDARD.encode(SPLASH_BG_VIDEO);
+    let titlebar_script = main_window_titlebar_injection_script();
     let i18n = serde_json::json!({
         "title": t!("error_page.title"),
         "heading": t!("error_page.heading"),
@@ -2239,6 +2271,10 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     </div>
   </main>
   <script>
+    (function () {{
+{titlebar_script}
+    }})();
+
     const i18n = {i18n_json};
     const backendUrl = {backend_url_json};
     const errorDetail = {error_detail_json};
@@ -2986,6 +3022,13 @@ fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<WebviewWindow
         .build()?;
     main_window.set_resizable(true)?;
 
+    // Windows/Linux: remove native decorations for the main window as well.
+    // Splash is configured as borderless in tauri.conf.json.
+    #[cfg(not(target_os = "macos"))]
+    {
+        main_window.set_decorations(false)?;
+    }
+
     Ok(main_window)
 }
 
@@ -2999,20 +3042,10 @@ fn reveal_window(window: &WebviewWindow) -> tauri::Result<()> {
 }
 
 fn minimize_main_window_to_tray(app: &tauri::AppHandle) {
-    #[cfg(windows)]
-    {
-        if let Some(window) = app.get_webview_window("main") {
-            info!("Destroying main window to release WebView resources while trayed");
-            if let Err(e) = window.destroy() {
-                warn!("Failed to destroy main window for tray mode: {:?}", e);
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.hide();
+    if let Some(window) = app.get_webview_window("main") {
+        // 保留 WebView 和 PyWebIO 会话，避免恢复托盘窗口时重新加载页面。
+        if let Err(e) = window.hide() {
+            warn!("Failed to hide main window for tray mode: {:?}", e);
         }
     }
 
@@ -3093,8 +3126,6 @@ fn toggle_main_window_visibility(
     }
 }
 
-// 保留旧实现供历史对照；主窗口当前使用原生 Windows 标题栏，不再调用此函数。
-#[allow(dead_code)]
 fn main_window_titlebar_injection_script() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -3141,7 +3172,7 @@ fn main_window_titlebar_injection_script() -> String {
             if (!document.getElementById('alas-launcher-titlebar-style')) {
                 const style = document.createElement('style');
                 style.id = 'alas-launcher-titlebar-style';
-                style.textContent = ':root{--alas-titlebar-height:44px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 120px 0 0;height:100%;pointer-events:auto;background:transparent;touch-action:none;app-region:drag;-webkit-app-region:drag}.header-icon,.header-icon *{app-region:no-drag;-webkit-app-region:no-drag}.header-icon{display:flex;align-items:center;gap:8px;padding:0 12px;position:absolute;top:0;right:0;height:100%;pointer-events:auto}.icon{width:12px;height:12px;min-width:12px;min-height:12px;margin:0;padding:0;line-height:1;border-radius:50%;border:none;cursor:pointer;flex:0 0 auto;position:relative;transition:filter 120ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:active{filter:brightness(0.85)}.icon-hide{background:#3b82f6;box-shadow:0 0 0 .5px #2563eb}.icon-close{background:#ff5f57;box-shadow:0 0 0 .5px #e0443e}.icon-minimize{background:#febc2e;box-shadow:0 0 0 .5px #d4a017}.icon-maximize{background:#28c840;box-shadow:0 0 0 .5px #14ae35}.icon svg{width:7px;height:7px;stroke:rgba(0,0,0,.72);fill:none;stroke-width:1.35;stroke-linecap:round;stroke-linejoin:round;opacity:0;transition:opacity 150ms ease}.header-icon:hover .icon svg{opacity:1}@media(max-width:680px){.alas-titlebar-drag-zone{inset-right:88px}}';
+                style.textContent = ':root{--alas-titlebar-height:44px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 144px 0 0;height:100%;pointer-events:auto;background:transparent;touch-action:none;app-region:drag;-webkit-app-region:drag}.header-icon,.header-icon *{app-region:no-drag;-webkit-app-region:no-drag}.header-icon{display:flex;align-items:center;gap:0;padding:0 4px;position:absolute;top:0;right:0;height:100%;pointer-events:auto}.icon{width:36px;height:44px;min-width:36px;min-height:44px;margin:0;padding:0;line-height:1;border:0;border-radius:0;background:transparent;color:#5f6368;cursor:pointer;flex:0 0 auto;position:relative;transition:background-color 120ms ease,color 120ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:hover{background:rgba(95,99,104,.12);color:#202124}.icon:active{background:rgba(95,99,104,.2)}.icon-close:hover{background:#d93025;color:#fff}.icon-close:active{background:#b3261e;color:#fff}.icon svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;opacity:1}@media(max-width:680px){.alas-titlebar-drag-zone{inset-right:112px}.icon{width:28px;min-width:28px}}';
                 style.textContent += '#alas-close-menu{position:fixed;top:8px;right:8px;z-index:2147483647;width:244px;padding:11px;border:1px solid rgba(255,255,255,.16);border-radius:18px;background:rgba(22,25,31,.92);box-shadow:0 18px 46px rgba(0,0,0,.3);backdrop-filter:blur(18px) saturate(1.25);-webkit-backdrop-filter:blur(18px) saturate(1.25);color:#fff;opacity:0;pointer-events:none;transform:translateY(-14px) scale(.72);transform-origin:calc(100% - 16px) 18px;transition:opacity 160ms ease,transform 220ms cubic-bezier(.2,.9,.25,1);app-region:no-drag;-webkit-app-region:no-drag}#alas-close-menu.is-open{opacity:1;pointer-events:auto;transform:translateY(0) scale(1)}#alas-close-menu *{box-sizing:border-box;app-region:no-drag;-webkit-app-region:no-drag}#alas-close-menu-title{margin:0 0 10px;font:500 12px/1.45 "MiSans",sans-serif;color:rgba(255,255,255,.78)}#alas-close-menu-actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}#alas-close-menu button{display:flex;align-items:center;justify-content:center;min-width:0;min-height:34px;margin:0;padding:0 10px;border:1px solid rgba(255,255,255,.14);border-radius:10px;background:rgba(255,255,255,.1);color:#fff;font:600 12px/1 "MiSans",sans-serif;cursor:pointer;transition:background 120ms ease,transform 120ms ease}#alas-close-menu button:hover{transform:translateY(-1px);background:rgba(255,255,255,.18)}#alas-close-menu button:active{transform:translateY(0)}#alas-close-menu button:disabled{opacity:.55;cursor:default;transform:none}#alas-close-menu .alas-close-confirm{border-color:rgba(255,113,106,.38);background:rgba(202,56,52,.82)}#alas-close-menu .alas-close-confirm:hover{background:rgba(225,68,63,.94)}';
                 document.head.appendChild(style);
             }

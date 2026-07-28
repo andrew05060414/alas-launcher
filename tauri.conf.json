@@ -12,7 +12,6 @@
         "width": 1280,
         "height": 880,
         "resizable": true,
-        "decorations": true,
         "additionalBrowserArgs": "--enable-features=msWebView2EnableDraggableRegions --disable-features=ElasticOverscroll,msWebOOUI,msPdfOOUI,msSmartScreenProtection",
         "url": "about:blank",
         "acceptFirstMouse": true,
