@@ -20,6 +20,16 @@ const APP_BRANDING_ASSETS: &[AppBrandingAsset] = &[
         sha256: "60a6b095cc872bb149c9b213f0b2ea8e9344369aea808dd21d2c57a9f9818832",
     },
     AppBrandingAsset {
+        target: "assets/spa/spa-icon-192x192.png",
+        data: include_bytes!("../branding/alas-app/spa-icon-192x192.png"),
+        sha256: "52690fec792f6d60c64ba40d856474b19d5697ebdeb01aabfa37a931015017dc",
+    },
+    AppBrandingAsset {
+        target: "assets/spa/spa-icon-512x512.png",
+        data: include_bytes!("../branding/alas-app/spa-icon-512x512.png"),
+        sha256: "69436a6754a93bdaaa91e982319cf6e9eba5670fcaf67c1921d46da7a77bc61a",
+    },
+    AppBrandingAsset {
         target: "assets/gui/icon/add.svg",
         data: include_bytes!("../branding/alas-app/add.svg"),
         sha256: "b1b4094551a123d98222991c61a6d76c1b92de7b6060d1d038e2402f45fc2a6b",
@@ -114,7 +124,9 @@ fn is_safe_relative_path(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
-        && path.starts_with("assets/gui/icon")
+        && (path.starts_with("assets/gui/icon")
+            || path == Path::new("assets/spa/spa-icon-192x192.png")
+            || path == Path::new("assets/spa/spa-icon-512x512.png"))
 }
 
 #[cfg(test)]
@@ -122,11 +134,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn branding_targets_are_confined_to_gui_icons() {
+    fn branding_targets_are_confined_to_public_branding_assets() {
         assert!(is_safe_relative_path(Path::new("assets/gui/icon/alas.svg")));
+        assert!(is_safe_relative_path(Path::new(
+            "assets/spa/spa-icon-192x192.png"
+        )));
         assert!(!is_safe_relative_path(Path::new("../config/deploy.yaml")));
         assert!(!is_safe_relative_path(Path::new(
             "assets/gui/css/custom.css"
+        )));
+        assert!(!is_safe_relative_path(Path::new(
+            "assets/spa/manifest.json"
         )));
     }
 }
