@@ -6,7 +6,7 @@ const MTLS_IDENTITY_ENV: &str = "ALAS_LAUNCHER_MTLS_IDENTITY_PEM_B64";
 const REQUIRE_MTLS_ENV: &str = "REQUIRE_LAUNCHER_MTLS_IDENTITY";
 const LAUNCHER_UPDATE_URL_ENV: &str = "LAUNCHER_UPDATE_URL";
 const DEFAULT_LAUNCHER_UPDATE_URL: &str =
-    "https://ap.launcher-update.nanoda.work/updata/stable.json";
+    "https://ap-launcher-update.nanoda.work/updata/stable.json";
 
 fn main() {
     let execution_level = if env::var("PROFILE").as_deref() == Ok("release") {
