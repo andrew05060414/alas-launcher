@@ -17,8 +17,16 @@ to `assets/gui/icon/` and `assets/spa/` after the AzurPilot repository update
 completes and before `gui.py` starts. This keeps the WebUI avatar, PWA icon,
 and status icons independent from the main repository source.
 
-Only allowlisted static branding paths are copied. Missing targets produce a
-warning and do not prevent the scheduler from starting.
+After those copies, the launcher also reapplies a small WebUI overlay:
+
+- append/replace marked CSS rules in `assets/gui/css/alas.css` and
+  `assets/gui/css/alas-pc.css` (header centering, overview row height)
+- replace the upstream header text `港区OA` with `ALAS` in
+  `module/webui/base.py`
+
+The overlay never copies whole CSS/Python files, so upstream WebUI updates
+still apply. Only allowlisted static branding paths are copied. Missing
+targets produce a warning and do not prevent the scheduler from starting.
 
 Build the Windows release from this branch with:
 
