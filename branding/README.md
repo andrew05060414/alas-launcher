@@ -16,9 +16,8 @@ launcher release so a cloud binary cannot silently replace the personal icon.
 page load, `src/branding.rs` injects a DOM overlay into the main WebView of the
 React frontend:
 
-- `img.brand-logo` (sidebar and login card) shows the ALAS avatar
-- the sidebar brand text and page title read `ALAS` instead of `AzurPilot`
-- the favicon uses the ALAS avatar
+- `img.brand-logo` (sidebar and login card) shows the Richelieu avatar (brand name and font stay upstream)
+- the favicon uses the same avatar
 - the titlebar buttons keep the rectangular Windows style (see `LAUNCHER_BUILD.md`)
 
 A `MutationObserver` reapplies the overlay after React re-renders. Nothing is

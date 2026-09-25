@@ -1,4 +1,4 @@
-//! 个人 ALAS 外观：在启动器 WebView 中把 AzurPilot 新前端的品牌头像和名称换成 ALAS。
+//! 个人外观：在启动器 WebView 中把 AzurPilot 新前端的品牌头像换成黎塞留头像，名称与字体沿用上游。
 //!
 //! 只在页面 DOM 上覆盖，不写入 AzurPilot 仓库，所以主仓库的 git 更新不会冲掉它，
 //! 也不会在工作区留下改动。React 重新渲染会把元素恢复成上游内容，
@@ -9,8 +9,6 @@ use std::sync::OnceLock;
 use base64::{prelude::BASE64_STANDARD, Engine};
 
 const AVATAR_PNG: &[u8] = include_bytes!("../branding/alas-app/avatar-192.png");
-const BRAND_NAME: &str = "ALAS";
-const UPSTREAM_BRAND_NAME: &str = "AzurPilot";
 
 /// 个人标题栏约束：矩形按钮、灰色图标、关闭按钮悬停整块变红（见 LAUNCHER_BUILD.md）。
 /// 上游样式是右上角的圆角玻璃胶囊，这里用 ID 选择器覆盖外观，保留上游的位置与拖拽逻辑。
@@ -31,8 +29,6 @@ const TITLEBAR_CSS: &str = concat!(
 const SCRIPT_TEMPLATE: &str = r#"
         (() => {
             const avatar = '__ALAS_AVATAR__';
-            const brandName = '__ALAS_BRAND_NAME__';
-            const upstreamName = '__ALAS_UPSTREAM_NAME__';
             const state = window.__ALAS_PERSONAL_BRANDING__
                 || (window.__ALAS_PERSONAL_BRANDING__ = {});
             const apply = () => {
@@ -47,14 +43,6 @@ const SCRIPT_TEMPLATE: &str = r#"
                     if (img.getAttribute('src') !== avatar) {
                         img.setAttribute('src', avatar);
                     }
-                    if (img.getAttribute('alt')) {
-                        img.setAttribute('alt', brandName);
-                    }
-                }
-                for (const text of document.querySelectorAll('.brand-title > span')) {
-                    if (text.textContent === upstreamName) {
-                        text.textContent = brandName;
-                    }
                 }
                 if (document.head) {
                     let icon = document.querySelector('link[rel~="icon"]');
@@ -67,9 +55,6 @@ const SCRIPT_TEMPLATE: &str = r#"
                         icon.setAttribute('type', 'image/png');
                         icon.setAttribute('href', avatar);
                     }
-                }
-                if (document.title.includes(upstreamName)) {
-                    document.title = document.title.split(upstreamName).join(brandName);
                 }
             };
             const schedule = () => {
@@ -88,7 +73,6 @@ const SCRIPT_TEMPLATE: &str = r#"
                 state.observer.observe(document.documentElement, {
                     childList: true,
                     subtree: true,
-                    characterData: true,
                     attributes: true,
                     attributeFilter: ['src', 'href'],
                 });
@@ -106,8 +90,6 @@ pub fn personal_branding_injection_script() -> &'static str {
         );
         SCRIPT_TEMPLATE
             .replace("__ALAS_AVATAR__", &avatar)
-            .replace("__ALAS_BRAND_NAME__", BRAND_NAME)
-            .replace("__ALAS_UPSTREAM_NAME__", UPSTREAM_BRAND_NAME)
             .replace("__ALAS_TITLEBAR_CSS__", TITLEBAR_CSS)
     })
 }
@@ -121,7 +103,8 @@ mod tests {
         let script = personal_branding_injection_script();
 
         assert!(script.contains("img.brand-logo"));
-        assert!(script.contains(".brand-title > span"));
+        assert!(!script.contains(".brand-title"), "名称与字体沿用上游");
+        assert!(!script.contains("document.title"));
         assert!(script.contains("link[rel~=\"icon\"]"));
         assert!(script.contains("new MutationObserver(schedule)"));
         assert!(!script.contains("pywebio"));
@@ -141,12 +124,7 @@ mod tests {
         let script = personal_branding_injection_script();
 
         assert!(script.contains("data:image/png;base64,iVBORw0KGgo"));
-        for placeholder in [
-            "__ALAS_AVATAR__",
-            "__ALAS_BRAND_NAME__",
-            "__ALAS_UPSTREAM_NAME__",
-            "__ALAS_TITLEBAR_CSS__",
-        ] {
+        for placeholder in ["__ALAS_AVATAR__", "__ALAS_TITLEBAR_CSS__"] {
             assert!(!script.contains(placeholder), "{placeholder}");
         }
         assert!(!script.contains("static/assets"));
