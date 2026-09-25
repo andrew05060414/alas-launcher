@@ -3,6 +3,7 @@
 
 mod autostart;
 mod backend;
+mod branding;
 mod i18n;
 mod launcher_control;
 mod nodejs;
@@ -2816,10 +2817,15 @@ if (!window.alas_launcher_injected) {
             };
             reader.readAsDataURL(blob);
         };
+__ALAS_PERSONAL_BRANDING_SCRIPT__
 __ALAS_TITLEBAR_SCRIPT__
     })();
 }
 "#
+        .replace(
+            "__ALAS_PERSONAL_BRANDING_SCRIPT__",
+            branding::personal_branding_injection_script(),
+        )
         .replace(
             "__ALAS_TITLEBAR_SCRIPT__",
             &main_window_titlebar_injection_script(),
@@ -4232,20 +4238,10 @@ fn reveal_window(window: &WebviewWindow) -> tauri::Result<()> {
 }
 
 fn minimize_main_window_to_tray(app: &tauri::AppHandle) {
-    #[cfg(windows)]
-    {
-        if let Some(window) = app.get_webview_window("main") {
-            info!("Destroying main window to release WebView resources while trayed");
-            if let Err(e) = window.destroy() {
-                warn!("Failed to destroy main window for tray mode: {:?}", e);
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.hide();
+    if let Some(window) = app.get_webview_window("main") {
+        // 保留 WebView 与前端会话，恢复托盘窗口时不白屏、不重新加载页面。
+        if let Err(e) = window.hide() {
+            warn!("Failed to hide main window for tray mode: {:?}", e);
         }
     }
 
