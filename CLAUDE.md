@@ -131,7 +131,7 @@ Windows 和 Linux 移除原生窗口装饰（`set_decorations(false)`），通�
 
 ### 窗口关闭行为
 
-- **Windows**：弹出对话框（"退出" / "最小化到托盘"），个人构建最小化时 `hide()` 主窗口，保留 WebView 与前端会话（见 `LAUNCHER_BUILD.md`）
+- **Windows**：弹出对话框（"退出" / "最小化到托盘"），最小化时 `destroy()` 主窗口释放 WebView 资源，恢复时重新创建
 - **macOS**：最小化到托盘，切换 `ActivationPolicy` 为 `Accessory`（隐藏 Dock 图标），恢复时切回 `Regular`
 - **Linux**：直接隐藏窗口
 

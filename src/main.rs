@@ -4238,10 +4238,20 @@ fn reveal_window(window: &WebviewWindow) -> tauri::Result<()> {
 }
 
 fn minimize_main_window_to_tray(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        // 保留 WebView 与前端会话，恢复托盘窗口时不白屏、不重新加载页面。
-        if let Err(e) = window.hide() {
-            warn!("Failed to hide main window for tray mode: {:?}", e);
+    #[cfg(windows)]
+    {
+        if let Some(window) = app.get_webview_window("main") {
+            info!("Destroying main window to release WebView resources while trayed");
+            if let Err(e) = window.destroy() {
+                warn!("Failed to destroy main window for tray mode: {:?}", e);
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
         }
     }
 

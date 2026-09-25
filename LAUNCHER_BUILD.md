@@ -20,7 +20,7 @@ Windows 主窗口必须使用 ALAS 自定义 Windows 风格标题栏：矩形按
 
 ### 托盘
 
-托盘最小化必须调用 `window.hide()`，保留 WebView 和前端会话。禁止为了节省内存调用 `window.destroy()`，否则恢复窗口时可能白屏或重载。
+托盘最小化沿用上游行为：Windows 上 `destroy()` 主窗口释放 WebView 资源，恢复时重新创建。
 
 ## 构建与部署
 
