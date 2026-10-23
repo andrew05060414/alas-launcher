@@ -31,6 +31,7 @@ pub fn start_launcher_control_stream(port: u16, allow_exit: Arc<AtomicBool>) {
         let report_url = format!("http://127.0.0.1:{port}/api/launcher/report");
         let client = match Client::builder()
             .connect_timeout(Duration::from_secs(5))
+            .timeout(None)
             .no_proxy()
             .build()
         {
@@ -134,6 +135,7 @@ fn handle_command(client: &Client, report_url: &str, command: LauncherCommand) {
 
     if let Err(e) = client
         .post(report_url)
+        .timeout(Duration::from_secs(10))
         .header(CONTENT_TYPE, "application/json")
         .body(report.to_string())
         .send()
