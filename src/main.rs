@@ -9,6 +9,8 @@ mod launcher_control;
 mod nodejs;
 mod notify;
 mod setup;
+#[cfg(any(windows, target_os = "macos"))]
+mod tray_scheduler;
 mod window_util;
 
 #[macro_use]
@@ -2121,11 +2123,19 @@ fn main() -> Result<()> {
                 let show_item = MenuItemBuilder::new(t!("tray.toggle_visibility"))
                     .id("toggle_visibility")
                     .build(app)?;
+                let scheduler_item = MenuItemBuilder::new(t!("tray.scheduler_unavailable"))
+                    .id("toggle_scheduler")
+                    .enabled(false)
+                    .build(app)?;
+                let scheduler_toggle =
+                    tray_scheduler::TraySchedulerToggle::new(scheduler_item.clone(), port);
+                scheduler_toggle.spawn_poller();
                 let quit_item = MenuItemBuilder::new(t!("tray.quit"))
                     .id("quit")
                     .build(app)?;
                 let tray_menu = MenuBuilder::new(app)
                     .item(&show_item)
+                    .item(&scheduler_item)
                     .separator()
                     .item(&quit_item)
                     .build()?;
@@ -2164,6 +2174,9 @@ fn main() -> Result<()> {
                                     port,
                                     recreating_main_window_for_menu.clone(),
                                 );
+                            }
+                            "toggle_scheduler" => {
+                                scheduler_toggle.toggle();
                             }
                             "quit" => {
                                 allow_exit.store(true, Ordering::SeqCst);
