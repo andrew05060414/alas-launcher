@@ -1049,6 +1049,7 @@ pub(crate) fn run() -> Result<()> {
             if payload.event() == tauri::webview::PageLoadEvent::Finished {
                 if let Some(window) = webview.app_handle().get_webview_window(webview.label()) {
                     sync_webview_visibility(&window);
+                    crate::branding::apply_window_icons(&window);
                 }
             }
         })

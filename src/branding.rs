@@ -78,6 +78,47 @@ pub fn personal_branding_injection_script() -> &'static str {
     })
 }
 
+/// 显式设置窗口的大图标（任务栏用）和小图标（标题栏、缩略图用），都来自内嵌的 ALAS 图标。
+///
+/// tao 只设置了小图标，大图标为空时 Windows 任务栏会回退到系统缓存里的旧图标。
+/// 同一个窗口只设置一次，避免页面每次加载都创建新的图标句柄。
+#[cfg(windows)]
+pub fn apply_window_icons(window: &tauri::WebviewWindow) {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use winapi::um::winuser::{
+        CreateIconFromResourceEx, SendMessageW, ICON_BIG, ICON_SMALL, LR_DEFAULTCOLOR, WM_SETICON,
+    };
+
+    static LAST_HWND: AtomicIsize = AtomicIsize::new(0);
+    const ICON_PNG: &[u8] = include_bytes!("../icons/icon.png");
+
+    let Ok(hwnd) = window.hwnd() else { return };
+    let raw = hwnd.0 as isize;
+    if LAST_HWND.swap(raw, Ordering::SeqCst) == raw {
+        return;
+    }
+    for (kind, size) in [(ICON_BIG, 256), (ICON_SMALL, 32)] {
+        // SAFETY: 传入的是内嵌 PNG 字节和有效窗口句柄；创建出的图标交给窗口持有。
+        unsafe {
+            let icon = CreateIconFromResourceEx(
+                ICON_PNG.as_ptr() as *mut u8,
+                ICON_PNG.len() as u32,
+                1,
+                0x0003_0000,
+                size,
+                size,
+                LR_DEFAULTCOLOR,
+            );
+            if !icon.is_null() {
+                SendMessageW(raw as _, WM_SETICON, kind as usize, icon as isize);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn apply_window_icons(_window: &tauri::WebviewWindow) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
