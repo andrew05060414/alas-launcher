@@ -18,6 +18,27 @@ const LAUNCHER_UPDATE_URL_ENV: &str = "LAUNCHER_UPDATE_URL";
 /// 未显式覆盖时使用的默认自更新源地址。
 const DEFAULT_LAUNCHER_UPDATE_URL: &str = "https://launcher-api.azurpilot.com/updata/stable.json";
 
+/// 把个人 ALAS 品牌图标覆盖到 `icons/`，返回是否存在品牌资源。
+fn sync_branding_assets(manifest_dir: &std::path::Path) -> bool {
+    let branding_dir = manifest_dir.join("branding/alas");
+    let icons_dir = manifest_dir.join("icons");
+    let mut present = false;
+    for name in ["icon.png", "icon.ico", "icon.icns"] {
+        let source = branding_dir.join(name);
+        let target = icons_dir.join(name);
+        if source.exists() {
+            present = true;
+            if fs::read(&source).ok() != fs::read(&target).ok() {
+                fs::copy(&source, &target).unwrap_or_else(|error| {
+                    panic!("failed to apply ALAS branding asset {} -> {}: {error}", source.display(), target.display())
+                });
+            }
+            println!("cargo:rerun-if-changed={}", source.display());
+        }
+    }
+    present
+}
+
 /// 执行 Tauri 构建并把编译期资源写入 `OUT_DIR`。
 ///
 /// 资源包括 launcher 的 mTLS 客户端证书，供运行时内嵌；
@@ -30,6 +51,10 @@ const DEFAULT_LAUNCHER_UPDATE_URL: &str = "https://launcher-api.azurpilot.com/up
 /// `CARGO_MANIFEST_DIR` 缺失、base64 解码失败、本地证书读取失败，或
 /// REQUIRE_LAUNCHER_MTLS_IDENTITY 已设置但证书缺失时直接 panic。
 fn main() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    if sync_branding_assets(&manifest_dir) {
+        println!("cargo:rustc-env=ALAS_LAUNCHER_DISABLE_SELF_UPDATE=1");
+    }
     // 内嵌 manifest：requireAdministrator 保证启动器始终以管理员运行，
     // 以便执行需要提权的安装与修复操作；Common-Controls 6 启用现代视觉
     // 样式，确保原生控件外观一致。

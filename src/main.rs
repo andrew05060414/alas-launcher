@@ -7,6 +7,7 @@
 
 /// 开机自启动管理。
 mod autostart;
+mod branding;
 /// gui.py 后端子进程的托管（启动、就绪探测、终止等）。
 mod backend;
 /// 后端环境协议的新旧名称与进程归属判断。
@@ -790,6 +791,10 @@ __AZURPILOT_TITLEBAR_SCRIPT__
         // 注入失败不影响页面本身功能，仅记录日志。
         if let Err(e) = webview.eval(&injected_js) {
             error!("Failed to inject JS to webview: {:?}", e);
+        }
+        // 个人品牌：把侧栏/登录页头像换成 ALAS 头像（见 branding/README.md）。
+        if let Err(e) = webview.eval(branding::personal_branding_injection_script()) {
+            error!("Failed to inject personal branding JS: {:?}", e);
         }
     }
 }

@@ -461,6 +461,11 @@ pub(crate) fn check_update(
     channel: UpdateChannel,
 ) -> Result<Option<AvailableUpdate>> {
     crate::launcher::ensure_not_cancelled(cancel)?;
+    // 个人品牌构建：禁止云端二进制替换带 ALAS 图标的 launcher。
+    if option_env!("ALAS_LAUNCHER_DISABLE_SELF_UPDATE").is_some() {
+        tracing::info!("Launcher self-update is disabled for this personal build");
+        return Ok(None);
+    }
     // 自更新重启后的新一轮启动带有跳过标记：取下标记并直接放行。
     if std::env::var_os(LAUNCHER_UPDATE_SKIP_ENV).is_some() {
         tracing::info!("Skipping launcher update check after restart");
