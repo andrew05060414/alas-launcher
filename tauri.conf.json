@@ -1,10 +1,16 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AzurPilot",
-  "version": "2.2.1",
-  "identifier": "moe.taiho.alas-launcher",
+  "version": "3.1.1",
+  "identifier": "moe.taiho.azurpilot",
   "app": {
     "withGlobalTauri": true,
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$DATA/AzurPilot/backgrounds/**"]
+      }
+    },
     "windows": [
       {
         "label": "main",
@@ -12,25 +18,35 @@
         "width": 1280,
         "height": 880,
         "resizable": true,
-        "additionalBrowserArgs": "--enable-features=msWebView2EnableDraggableRegions --disable-features=ElasticOverscroll,msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server",
+        "additionalBrowserArgs": "--enable-features=msWebView2EnableDraggableRegions --disable-features=ElasticOverscroll,msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server --autoplay-policy=no-user-gesture-required",
         "url": "about:blank",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) AzurPilot/__AZURPILOT_VERSION__ Chrome/144.0.7559.60 Electron/40.0.0 Safari/537.36",
         "acceptFirstMouse": true,
         "visible": false,
         "create": false
       },
       {
-        "label": "splash",
+        "label": "launcher",
         "title": "AzurPilot",
-        "width": 800,
-        "height": 450,
-        "resizable": false,
+        "width": 1100,
+        "height": 700,
+        "resizable": true,
         "decorations": false,
-        "additionalBrowserArgs": "--enable-features=msWebView2EnableDraggableRegions --disable-features=ElasticOverscroll,msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server",
-        "url": "about:blank",
+        "additionalBrowserArgs": "--enable-features=msWebView2EnableDraggableRegions --disable-features=ElasticOverscroll,msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server --autoplay-policy=no-user-gesture-required",
+        "url": "index.html",
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) AzurPilot/__AZURPILOT_VERSION__ Chrome/144.0.7559.60 Electron/40.0.0 Safari/537.36",
         "acceptFirstMouse": true,
         "visible": false,
-        "create": true
+        "create": true,
+        "minWidth": 900,
+        "minHeight": 600
       }
     ]
+  },
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "frontend/dist"
   }
 }

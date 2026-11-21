@@ -1,0 +1,920 @@
+@font-face {
+  font-family: MiSans;
+  src: url("../../fonts/MiSansLauncher.ttf") format("truetype");
+  font-weight: 150 700;
+  font-display: swap;
+}
+/* 主 VF 不含泰文 / 阿拉伯文，猫娘语颜文字用到时按需加载对应子字体。 */
+@font-face {
+  font-family: MiSans;
+  src: url("../../fonts/MiSansThaiLauncher.ttf") format("truetype");
+  font-weight: 150 700;
+  font-display: swap;
+  unicode-range: U+0E00-0E7F;
+}
+@font-face {
+  font-family: MiSans;
+  src: url("../../fonts/MiSansArabicLauncher.ttf") format("truetype");
+  font-weight: 150 700;
+  font-display: swap;
+  unicode-range: U+0600-06FF;
+}
+@font-face {
+  font-family: GoogleSans;
+  src: url("../../fonts/GoogleSansLauncher.ttf") format("truetype");
+  font-weight: 400 700;
+  font-display: swap;
+}
+/* WinUI 3 / Fluent 2 分层：交互控件全部来自 @fluentui/react-components，
+   这里只保留布局、Mica 底材与文字阶梯。深浅双主题跟随系统。
+   GoogleSans 在前负责英文与数字，中文回退 MiSans，字重按各字体实际轴范围声明。 */
+:root {
+  font-family:
+    GoogleSans, MiSans, "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI",
+    "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  color: #ffffff;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --font-mono: "Cascadia Code", Consolas, "Courier New", monospace;
+  --text-1: #ffffff;
+  --text-2: #cfcfcf;
+  --text-3: #9e9e9e;
+  --accent: #4cc2ff;
+  --critical: #ff99a4;
+  --success: #6ccb5f;
+  --card: rgba(255, 255, 255, 0.05);
+  --card-stroke: rgba(255, 255, 255, 0.07);
+  --card-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+  --divider: rgba(255, 255, 255, 0.083);
+  --control-hover: rgba(255, 255, 255, 0.08);
+  --control-active: rgba(255, 255, 255, 0.04);
+  --mica:
+    linear-gradient(
+      90deg,
+      rgba(20, 22, 27, 0.92) 0%,
+      rgba(20, 22, 27, 0.74) 55%,
+      rgba(20, 22, 27, 0.56) 100%
+    ),
+    linear-gradient(0deg, rgba(16, 17, 21, 0.9) 0%, rgba(16, 17, 21, 0.08) 60%);
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    color: #1b1b1b;
+    --text-1: #1b1b1b;
+    --text-2: #424242;
+    --text-3: #616161;
+    --accent: #005fb8;
+    --critical: #c42b1c;
+    --success: #0f7b0f;
+    --card: rgba(252, 252, 252, 0.72);
+    --card-stroke: rgba(0, 0, 0, 0.09);
+    --card-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+    --divider: rgba(0, 0, 0, 0.08);
+    --control-hover: rgba(0, 0, 0, 0.06);
+    --control-active: rgba(0, 0, 0, 0.03);
+    --mica:
+      linear-gradient(
+        90deg,
+        rgba(243, 243, 243, 0.94) 0%,
+        rgba(243, 243, 243, 0.78) 55%,
+        rgba(243, 243, 243, 0.62) 100%
+      ),
+      linear-gradient(0deg, rgba(243, 243, 243, 0.9) 0%, rgba(243, 243, 243, 0.08) 60%);
+    color-scheme: light;
+  }
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+.shell {
+  position: relative;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  isolation: isolate;
+  overflow: hidden;
+  color: var(--text-1);
+  /* 主页禁选文本与拖拽（右键菜单由 JS 屏蔽）；错误日志块单独放开。 */
+  user-select: none;
+  -webkit-user-select: none;
+}
+.background,
+.backgroundStill,
+.shade {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -2;
+}
+.background,
+.backgroundStill {
+  object-fit: cover;
+}
+.shade {
+  z-index: -1;
+  background: var(--mica);
+}
+.titlebar {
+  height: 56px;
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  padding-left: 16px;
+  user-select: none;
+  touch-action: none;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;
+}
+.logo {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: block;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+.wordmark {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+.wordmark span {
+  color: var(--accent);
+}
+.brandVersion {
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+.windowControls {
+  display: flex;
+  height: 100%;
+  align-items: center;
+  gap: 2px;
+  padding-right: 6px;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+/* 悬浮式圆角标题栏按钮：44x34、圆角 8px，悬停/红色关闭键均为圆角矩形。 */
+.captionButton {
+  width: 44px;
+  height: 34px;
+  min-width: 44px !important;
+  padding: 0 !important;
+  border-radius: 8px !important;
+}
+.captionButton:hover:not(:disabled) {
+  background-color: var(--control-hover) !important;
+  color: var(--text-1) !important;
+}
+.captionButton:active:not(:disabled) {
+  background-color: var(--control-active) !important;
+  color: var(--text-1) !important;
+}
+.closeButton:hover:not(:disabled) {
+  background-color: #c42b1c !important;
+  color: #fff !important;
+}
+.closeButton:active:not(:disabled) {
+  background-color: #b1261b !important;
+  color: #fff !important;
+}
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 40px 56px 24px;
+  gap: 32px;
+}
+.hero {
+  max-width: 640px;
+}
+.hero h1 {
+  font-weight: 600;
+  font-size: 40px;
+  line-height: 1.22;
+  letter-spacing: -0.02em;
+  margin: 0 0 16px;
+  text-wrap: balance;
+}
+.description {
+  font-size: 14px;
+  line-height: 1.75;
+  color: var(--text-2);
+  max-width: 36em;
+  margin: 0;
+}
+.panel {
+  padding: 24px 28px 0;
+}
+/* 面板信息 + 底部动作行：动作行几何与空闲态 idleBar 一致，
+   主按钮距窗口右/下边缘 24px。 */
+.bottomStack {
+  display: flex;
+  flex-direction: column;
+}
+.taskDetail {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-2);
+  margin: 12px 0 0;
+  overflow-wrap: anywhere;
+}
+.updateNotes {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-2);
+  margin: 6px 0 0;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+.actions {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 16px;
+  /* 主按钮与空闲态大按钮对齐：抵消 main 56px 右内边距到 24px。 */
+  margin-right: -32px;
+}
+.secondaryActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.primary {
+  flex-shrink: 0;
+}
+/* 主按钮是所有状态的视觉焦点；双类选择器压过 Fluent 运行时注入的
+   同优先级原子样式（border-radius/font-size/min-width 都被它设过）。 */
+.idleBar .primary,
+.bottomStack .primary {
+  min-width: 280px;
+  height: 56px;
+  font-size: 18px;
+  border-radius: 8px;
+}
+.idleBar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  /* 抵消 main 的 56px 右内边距，使按钮距窗口右/下边缘对称 24px。 */
+  margin-right: -32px;
+}
+.launchStack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+/* 空闲态主按钮是画面焦点，图标比面板态更大。 */
+.idleBar .primary svg {
+  font-size: 24px;
+}
+/* 任务进行中：保持品牌蓝不落入 disabled 灰态、无描边，双击取消。 */
+.launchingButton {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--accent) !important;
+  color: #fff !important;
+  border: none !important;
+  cursor: default;
+}
+.launchingButton:hover,
+.launchingButton:active {
+  background-color: var(--accent) !important;
+  color: #fff !important;
+}
+.launchHint {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-3);
+  margin-right: 4px;
+  user-select: none;
+  overflow: hidden;
+  white-space: nowrap;
+}
+/* 轮播小贴士：切换时 key 变化重启动画，淡入并轻微上移。 */
+.launchTip {
+  display: inline-block;
+  animation: tipRotate 300ms ease-out;
+}
+@keyframes tipRotate {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .launchTip {
+    animation: none;
+  }
+}
+:global(html.reduced-motion) .launchTip {
+  animation: none;
+}
+/* 按钮内进度填充层：文字与图标浮于其上。 */
+.launchingButton > * {
+  position: relative;
+  z-index: 1;
+}
+.launchFill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 0;
+  width: 0%;
+  background: rgba(255, 255, 255, 0.22);
+  transition: width 250ms ease;
+  pointer-events: none;
+}
+.launchText {
+  display: inline-block;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  animation: launchSwap 420ms ease;
+}
+@keyframes launchSwap {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .launchText {
+    animation: none;
+  }
+}
+/* 启动器设置开启“减弱动态效果”时与系统偏好同等对待。 */
+:global(html.reduced-motion) .launchText {
+  animation: none;
+}
+:global(html.reduced-motion) .launchFill {
+  transition: none;
+}
+.progressGroup {
+  margin-top: 20px;
+  display: grid;
+  gap: 16px;
+}
+.progressLabel {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 13px;
+  color: var(--text-2);
+  margin-bottom: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.progressLabel span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subProgress .progressLabel {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.errorSummary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  cursor: pointer;
+  color: var(--critical);
+  font-size: 14px;
+  user-select: none;
+  background: none;
+  border: none;
+  font-family: inherit;
+}
+.errorSummary:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.errorSummary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.errorLog {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+  max-height: 160px;
+  overflow: auto;
+  user-select: text;
+  -webkit-user-select: text;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+  padding: 8px 0 0;
+  user-select: text;
+}
+.dialog {
+  max-width: min(560px, calc(100vw - 32px));
+}
+.errorDialog {
+  max-width: min(640px, calc(100vw - 32px));
+}
+.errorDialog button {
+  white-space: nowrap;
+}
+.dialogHint {
+  margin: 12px 0 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-3);
+}
+
+/* WinUI 3 风格标准 MessageBox / ContentDialog 规范 */
+.messageBoxSurface {
+  padding: 0 !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+  border: 1px solid var(--colorNeutralStroke1) !important;
+  box-shadow: 0 20px 44px rgba(0, 0, 0, 0.28), 0 0 2px rgba(0, 0, 0, 0.12) !important;
+  background-color: var(--colorNeutralBackground1) !important;
+  max-width: min(448px, calc(100vw - 32px));
+  width: 100%;
+  /* WinUI 3 原生 MessageBox 是瞬时弹出：禁用 Fluent 淡入过渡，
+     避免休眠标签页/被节流的渲染时钟把过渡冻结在 opacity 0（弹窗隐形）。 */
+  transition: none !important;
+}
+.confirmMessageBoxSurface {
+  max-width: min(448px, calc(100vw - 32px));
+}
+.errorMessageBoxSurface {
+  max-width: min(580px, calc(100vw - 32px));
+}
+.messageBoxBody {
+  padding: 0 !important;
+  margin: 0 !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+.messageBoxContent {
+  padding: 24px 24px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.messageBoxHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.messageBoxTitleGroup {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.messageBoxTitle {
+  font-size: 20px !important;
+  font-weight: 600 !important;
+  line-height: 28px !important;
+  color: var(--colorNeutralForeground1) !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+.messageBoxErrorIcon {
+  color: #c42b1c;
+  font-size: 24px;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.messageBoxCloseBtn {
+  width: 32px !important;
+  height: 32px !important;
+  min-width: 32px !important;
+  padding: 0 !important;
+  border-radius: 4px !important;
+  margin-right: -4px;
+  margin-top: -4px;
+}
+.messageBoxBodyText {
+  font-size: 14px !important;
+  line-height: 20px !important;
+  color: var(--colorNeutralForeground1) !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  user-select: text;
+}
+.messageBoxInnerContent {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+.messageBoxLogCard {
+  background-color: var(--colorNeutralBackground2);
+  border: 1px solid var(--colorNeutralStroke2);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--colorNeutralForeground2);
+  max-height: 160px;
+  overflow-y: auto;
+  user-select: text;
+  -webkit-user-select: text;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+.messageBoxHintGroup {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 2px;
+}
+.messageBoxHintIcon {
+  font-size: 16px;
+  color: var(--colorNeutralForeground3);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.messageBoxAdvice {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--colorPaletteRedForeground1, #b10e1c);
+  margin: 0 0 12px;
+}
+.messageBoxHint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--colorNeutralForeground3);
+  margin: 0;
+}
+.messageBoxFooter {
+  background-color: var(--colorNeutralBackground3, #f0f2f5) !important;
+  border-top: 1px solid var(--colorNeutralStroke2) !important;
+  padding: 16px 24px !important;
+  display: flex !important;
+  gap: 8px !important;
+  margin: 0 !important;
+  box-sizing: border-box !important;
+  width: 100% !important;
+}
+.messageBoxFooterEqual {
+  justify-content: stretch !important;
+}
+.messageBoxFooterEqual > * {
+  flex: 1 1 0 !important;
+  min-width: 0 !important;
+}
+.messageBoxFooterEnd {
+  justify-content: flex-end !important;
+}
+/* 独立连接弹窗窗口：整个窗口即弹窗（native_dialog.rs 打开的 connection 窗口）。
+   无边框 + Win10+ 亚克力材质：底色高透明让背后内容模糊透出（WinUI 3 浮层）。 */
+.connectionWindow {
+  position: relative;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background-color: color-mix(in srgb, var(--colorNeutralBackground1) 78%, transparent);
+  overflow: hidden;
+  border-radius: 8px;
+  border: 1px solid var(--colorNeutralStroke1);
+  box-shadow: 0 20px 44px rgba(0, 0, 0, 0.28), 0 0 2px rgba(0, 0, 0, 0.12);
+}
+.connectionWindow .messageBoxContent {
+  flex: 1;
+  min-height: 0;
+}
+/* 崩溃报告窗：高度由内容决定（Rust 侧 window_fit_content 贴合），不撑满视口。 */
+.crashWindow {
+  position: relative;
+  height: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background-color: color-mix(in srgb, var(--colorNeutralBackground1) 78%, transparent);
+  overflow: hidden;
+  border-radius: 8px;
+  border: 1px solid var(--colorNeutralStroke1);
+  box-shadow: 0 20px 44px rgba(0, 0, 0, 0.28), 0 0 2px rgba(0, 0, 0, 0.12);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.crashWindow .messageBoxContent {
+  flex: 0 0 auto;
+}
+.crashWindow .messageBoxFooter {
+  background-color: color-mix(in srgb, var(--colorNeutralBackground3, #f0f2f5) 82%, transparent) !important;
+}
+.crashWindow .messageBoxCloseBtn {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+/* 云母窗口内底部操作栏同样半透明，让材质连续透出。 */
+.connectionWindow .messageBoxFooter {
+  background-color: color-mix(in srgb, var(--colorNeutralBackground3, #f0f2f5) 82%, transparent) !important;
+}
+
+/* 无边框弹窗的拖动区：覆盖顶部标题整行，加大可触发范围。 */
+.connectionDragRegion {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 60px;
+  z-index: 1;
+  cursor: move;
+}
+/* 弹窗文字全部不可选中（含原因卡片）。 */
+.connectionWindow {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.connectionWindow .messageBoxLogCard {
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* 关闭键独立浮在窗口右上角（对齐 WinUI 3 系统弹窗：X 与标题不同行）。 */
+.connectionWindow .messageBoxCloseBtn {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+.connectionHint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--colorPaletteRedForeground1, #b10e1c);
+}
+.messageBoxBtn {
+  height: 32px !important;
+  min-height: 32px !important;
+  border-radius: 4px !important;
+  font-size: 14px !important;
+  white-space: nowrap !important;
+}
+.messageBoxPrimaryBtn {
+  height: 32px !important;
+  min-height: 32px !important;
+  border-radius: 4px !important;
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  white-space: nowrap !important;
+}
+
+/* Windows 11 / WinUI 3 Smoke 烟雾磨砂遮罩 */
+:global(.fui-DialogSurface__backdrop) {
+  background-color: rgba(0, 0, 0, 0.35) !important;
+  backdrop-filter: blur(16px) !important;
+  -webkit-backdrop-filter: blur(16px) !important;
+}
+:global(html.reduced-motion) :global(.fui-DialogSurface__backdrop) {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  transition: none !important;
+}
+.packProgress {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.settingsRows {
+  display: grid;
+  gap: 0;
+}
+/* 设置分组标题：弱化展示，仅在组间保留一条分隔线。 */
+.settingsGroupTitle {
+  padding: 14px 2px 4px;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.4;
+  color: var(--text-3);
+  border-top: 1px solid var(--divider);
+}
+.settingsGroupTitle:first-child {
+  padding-top: 2px;
+  border-top: none;
+}
+/* 设置项：图标 + 标题 + 右侧控件，组内不再逐行画线。 */
+.settingCard {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 8px 2px;
+  /* 标题是纯展示文本：避免浏览器在文字上显示 I 形编辑光标。 */
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.settingCardIcon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--text-2);
+}
+.settingCardIcon svg {
+  width: 20px;
+  height: 20px;
+}
+.settingCardTitle {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-1);
+}
+.settingCardStatus {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.settingCardControl {
+  flex: none;
+  display: flex;
+  align-items: center;
+  /* 控件自身维持 Fluent 的指针样式与可选中性文本。 */
+  cursor: auto;
+  user-select: auto;
+  -webkit-user-select: auto;
+}
+.settingCardControl :global(.fui-Dropdown) {
+  width: 160px;
+}
+/* 设置右侧操作区：主按钮统一宽度，三行右边缘与左边缘对齐。 */
+.settingActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.settingActionMain {
+  min-width: 104px;
+}
+.settingColorDot {
+  display: inline-block;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-right: 8px;
+  border: 1px solid var(--divider);
+  border-radius: 3px;
+}
+.settingHexText {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+.colorPopover {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(256px, calc(100vw - 32px));
+}
+.colorPopover :global(.fui-ColorPicker) {
+  gap: 8px;
+}
+/* 覆盖 Fluent 控件的默认最小尺寸，使取色控件随弹窗收窄。 */
+.colorPopover :global(.fui-ColorSlider),
+.colorPopover :global(.fui-ColorArea) {
+  min-width: 0;
+}
+.colorPopover :global(.fui-ColorArea) {
+  min-height: 132px;
+  margin-bottom: 0;
+}
+.colorPopoverActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.colorPopoverActions > :first-child {
+  margin-inline-end: auto;
+}
+@media (max-width: 920px) {
+  .main {
+    padding: 32px;
+    gap: 24px;
+  }
+  .hero h1 {
+    font-size: 34px;
+  }
+  .panel {
+    padding: 24px;
+  }
+  .actions {
+    gap: 12px;
+  }
+}
+@media (max-width: 600px) {
+  .main {
+    padding: 24px 16px;
+  }
+  .hero h1 {
+    font-size: 28px;
+  }
+  .titlebar {
+    padding-left: 12px;
+  }
+  .actions {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+  .panel {
+    padding: 20px 16px;
+  }
+  .description {
+    font-size: 13px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .background {
+    visibility: hidden;
+  }
+}
+
+.settingsContent {
+  max-height: min(560px, calc(100dvh - 160px));
+  overflow-y: auto;
+  padding-bottom: 20px;
+  padding-right: 10px;
+  /* 设置弹窗滚动条完全隐藏，内容仍可滚动；覆盖全局胶囊滚动条样式。 */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.settingsContent::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+  display: none !important;
+}
+
+/* Windows 11 / WinUI 3 动态极简胶囊滚动条（移除原生丑陋粗滚动条与三角箭头） */
+:global(*)::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+:global(*)::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+:global(*)::-webkit-scrollbar-track {
+  background: transparent !important;
+}
+:global(*)::-webkit-scrollbar-thumb {
+  background-color: rgba(128, 128, 128, 0.32);
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  background-clip: padding-box;
+  transition: background-color 160ms ease;
+}
+:global(*)::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(128, 128, 128, 0.55);
+}
+:global(*)::-webkit-scrollbar-thumb:active {
+  background-color: rgba(128, 128, 128, 0.75);
+}
+:global(*) {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(128, 128, 128, 0.35) transparent;
+}

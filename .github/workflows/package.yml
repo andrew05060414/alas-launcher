@@ -2,23 +2,274 @@ name: Pack AzurPilot
 
 on:
   push:
+    # Default-branch caches can be restored by subsequent release tags.
+    branches: [main]
+    paths:
+      - '.github/workflows/package.yml'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'src/**'
+      - 'frontend/**'
+      - 'locales/**'
+      - 'capabilities/**'
+      - 'bg/**'
+      - 'fonts/**'
+      - 'icons/**'
+      - 'tauri.conf.json'
+      - 'deploy.*.yaml'
+      - 'tools/**'
+      - 'cf-worker/**'
+      - 'install.iss'
+      - 'Info.plist'
     tags:
       - '*'
+  schedule:
+    - cron: "17 */6 * * *"
+  repository_dispatch:
+    types: [runtime-components]
   workflow_dispatch:
     inputs:
       version:
         description: Version to build when not running from a tag. Leave empty to use Cargo.toml.
         required: false
         type: string
-
-env:
-  UV_VERSION: "0.11.32"
-  UV_MANAGED_PYTHON: 1
-  UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/python
-  UV_PYTHON: 3.14.6
+      repair_urls:
+        description: Add missing cnb_url/gitcode_url direct links to the online stable.json platforms, then republish. No builds or payload uploads.
+        required: false
+        default: false
+        type: boolean
 
 jobs:
+  runtime-revision:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+    steps:
+      # 日志脱敏：注册 URL 掩码清单（明文见 tools/ci/log-mask.txt；base64 藏在
+      # 环境变量里，避免本步骤自身的日志先出现 URL）。掩码对本 job 之后的全部
+      # 日志生效；修改清单后需重新 base64 并同步两个 workflow 的所有 job。
+      - name: Register log masks
+        shell: bash
+        env:
+          AZURPILOT_LOG_MASK_B64: "IyBDSSDml6Xlv5fmjqnnoIHmuIXljZXvvIjmmI7mlofln7rlh4bvvInjgIIKIyDmr4/kuKogam9iIOmmluatpeaKiuWug+mAkOihjOazqOWGjOS4uiA6OmFkZC1tYXNrOjrvvIxHaXRIdWIg5Lya5oqK5pel5b+X5Lit5ZG95Lit55qE5a2Q5Liy5pu/5o2i5Li6ICoqKuOAggojIOS/ruaUueWQjuaJp+ihjDogYmFzZTY0IC13MCDmnKzmlofku7bvvIjot7Pov4fms6jph4rooYzvvInvvIzmiorovpPlh7rlkIzmraXmm7/mjaIKIyAuZ2l0aHViL3dvcmtmbG93cy9wYWNrYWdlLnltbCDkuI4gdGVzdC55bWwg5Lit5omA5pyJIEFaVVJQSUxPVF9MT0dfTUFTS19CNjQg55qE5YC844CCCiMg5rOo5oSP77ya5pys5paH5Lu25LiN5Lya5Ye6546w5Zyo5pel5b+X6YeM77yI5o6p56CB5q2l6aqk5Y+q6L6T5Ye6IGFkZC1tYXNrIOWRveS7pO+8ie+8jOaUueWKqOivt+S/neaMgeavj+ihjOS4gOS4quWujOaVtOadoeebruOAgeS4jeimgeeVmeepuuihjOOAggpodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8uZXh0cmFoZWFkZXIKaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvc3RhYmxlLmpzb24KaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tL3VwZGF0YS9zdGFibGUuanNvbgpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tCmh0dHBzOi8vbGF1bmNoZXItZG93bmxvYWQuYXp1cnBpbG90LmNvbQpodHRwczovL2FwaS5jbmIuY29vbApodHRwczovL2NuYi5jb29sCmh0dHBzOi8vZ2l0aHViLmNvbS93ZXNzMDkvQXp1clBpbG90TGF1bmNoZXIKaHR0cHM6Ly9naXRodWIuY29tL3dlc3MwOS9BenVyUGlsb3QKaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbQpodHRwczovL3VwbG9hZHMuZ2l0aHViLmNvbQpodHRwczovL29iamVjdHMuZ2l0aHVidXNlcmNvbnRlbnQuY29tCmh0dHBzOi8vZG9jcy5naXRodWIuY29tCmh0dHBzOi8vZ2l0aHViLmNvbS9hc3RyYWwtc2gvc2V0dXAtdXYKaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2FzdHJhbC1zaC9zZXR1cC11dgpodHRwczovL2dpdGh1Yi5jb20vYXN0cmFsLXNoL3V2Cmh0dHBzOi8vYXN0cmFsLnNoCmh0dHBzOi8vZ2l0aHViLmNvbS9hY3Rpb25zL3B5dGhvbi12ZXJzaW9ucwpodHRwczovL2dpdGh1Yi5jb20vYWN0aW9ucy9zZXR1cC1weXRob24KaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvbm9kZS12ZXJzaW9ucwpodHRwczovL3N0YXRpYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vc2gucnVzdHVwLnJzCmh0dHBzOi8vY3JhdGVzLmlvCmh0dHBzOi8vaW5kZXguY3JhdGVzLmlvCmh0dHBzOi8vc3RhdGljLmNyYXRlcy5pbwpodHRwczovL2RvYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vZ2l0aHViLmNvbS9ydXN0LWxhbmcKaHR0cHM6Ly92Mi50YXVyaS5hcHAKaHR0cHM6Ly90YXVyaS5hcHAKaHR0cHM6Ly93d3cuaW5ub3NldHVwLmNvbQpodHRwczovL3JvbGx1cGpzLm9yZwpodHRwczovL3ZpdGUuZGV2Cmh0dHBzOi8vcmVnaXN0cnkubnBtanMub3JnCmh0dHBzOi8vZG9jcy5ucG1qcy5jb20KaHR0cHM6Ly9jbGkuZ2l0aHViLmNvbQpodHRwczovL3B5cGkub3JnCmh0dHBzOi8vZmlsZXMucHl0aG9uaG9zdGVkLm9yZwpodHRwczovL2RsLmdvb2dsZS5jb20KaHR0cHM6Ly9wYWNrYWdlcy5taWNyb3NvZnQuY29tCmh0dHBzOi8vY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9jb21tdW5pdHkuY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9ha2EubXMKaHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvd29ya2Vycy1zZGsKaHR0cHM6Ly9leGFtcGxlLmNvbQpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbQpsYXVuY2hlci1kb3dubG9hZC5henVycGlsb3QuY29tCmF6dXJwaWxvdC5jb20KYXBpLmNuYi5jb29sCmNuYi5jb29sCmxhdW5jaGVyLWNsb3VkZmxhcmUtY2RuLWRvd25sb2FkLmF6dXJwaWxvdC5jb20K"
+        run: |
+          printf '%s' "$AZURPILOT_LOG_MASK_B64" | openssl base64 -d -A | while IFS= read -r value; do
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+          done
+      - name: Resolve one backend revision for every platform
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(git ls-remote https://github.com/wess09/AzurPilot.git refs/heads/master | cut -f1)"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+  runtime-components:
+    needs: runtime-revision
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+          - os: windows-latest
+            platform: windows-x86_64
+          - os: macos-latest
+            platform: macos-aarch64
+    steps:
+      # 日志脱敏：注册 URL 掩码清单（明文见 tools/ci/log-mask.txt；base64 藏在
+      # 环境变量里，避免本步骤自身的日志先出现 URL）。掩码对本 job 之后的全部
+      # 日志生效；修改清单后需重新 base64 并同步两个 workflow 的所有 job。
+      - name: Register log masks
+        shell: bash
+        env:
+          AZURPILOT_LOG_MASK_B64: "IyBDSSDml6Xlv5fmjqnnoIHmuIXljZXvvIjmmI7mlofln7rlh4bvvInjgIIKIyDmr4/kuKogam9iIOmmluatpeaKiuWug+mAkOihjOazqOWGjOS4uiA6OmFkZC1tYXNrOjrvvIxHaXRIdWIg5Lya5oqK5pel5b+X5Lit5ZG95Lit55qE5a2Q5Liy5pu/5o2i5Li6ICoqKuOAggojIOS/ruaUueWQjuaJp+ihjDogYmFzZTY0IC13MCDmnKzmlofku7bvvIjot7Pov4fms6jph4rooYzvvInvvIzmiorovpPlh7rlkIzmraXmm7/mjaIKIyAuZ2l0aHViL3dvcmtmbG93cy9wYWNrYWdlLnltbCDkuI4gdGVzdC55bWwg5Lit5omA5pyJIEFaVVJQSUxPVF9MT0dfTUFTS19CNjQg55qE5YC844CCCiMg5rOo5oSP77ya5pys5paH5Lu25LiN5Lya5Ye6546w5Zyo5pel5b+X6YeM77yI5o6p56CB5q2l6aqk5Y+q6L6T5Ye6IGFkZC1tYXNrIOWRveS7pO+8ie+8jOaUueWKqOivt+S/neaMgeavj+ihjOS4gOS4quWujOaVtOadoeebruOAgeS4jeimgeeVmeepuuihjOOAggpodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8uZXh0cmFoZWFkZXIKaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvc3RhYmxlLmpzb24KaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tL3VwZGF0YS9zdGFibGUuanNvbgpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tCmh0dHBzOi8vbGF1bmNoZXItZG93bmxvYWQuYXp1cnBpbG90LmNvbQpodHRwczovL2FwaS5jbmIuY29vbApodHRwczovL2NuYi5jb29sCmh0dHBzOi8vZ2l0aHViLmNvbS93ZXNzMDkvQXp1clBpbG90TGF1bmNoZXIKaHR0cHM6Ly9naXRodWIuY29tL3dlc3MwOS9BenVyUGlsb3QKaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbQpodHRwczovL3VwbG9hZHMuZ2l0aHViLmNvbQpodHRwczovL29iamVjdHMuZ2l0aHVidXNlcmNvbnRlbnQuY29tCmh0dHBzOi8vZG9jcy5naXRodWIuY29tCmh0dHBzOi8vZ2l0aHViLmNvbS9hc3RyYWwtc2gvc2V0dXAtdXYKaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2FzdHJhbC1zaC9zZXR1cC11dgpodHRwczovL2dpdGh1Yi5jb20vYXN0cmFsLXNoL3V2Cmh0dHBzOi8vYXN0cmFsLnNoCmh0dHBzOi8vZ2l0aHViLmNvbS9hY3Rpb25zL3B5dGhvbi12ZXJzaW9ucwpodHRwczovL2dpdGh1Yi5jb20vYWN0aW9ucy9zZXR1cC1weXRob24KaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvbm9kZS12ZXJzaW9ucwpodHRwczovL3N0YXRpYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vc2gucnVzdHVwLnJzCmh0dHBzOi8vY3JhdGVzLmlvCmh0dHBzOi8vaW5kZXguY3JhdGVzLmlvCmh0dHBzOi8vc3RhdGljLmNyYXRlcy5pbwpodHRwczovL2RvYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vZ2l0aHViLmNvbS9ydXN0LWxhbmcKaHR0cHM6Ly92Mi50YXVyaS5hcHAKaHR0cHM6Ly90YXVyaS5hcHAKaHR0cHM6Ly93d3cuaW5ub3NldHVwLmNvbQpodHRwczovL3JvbGx1cGpzLm9yZwpodHRwczovL3ZpdGUuZGV2Cmh0dHBzOi8vcmVnaXN0cnkubnBtanMub3JnCmh0dHBzOi8vZG9jcy5ucG1qcy5jb20KaHR0cHM6Ly9jbGkuZ2l0aHViLmNvbQpodHRwczovL3B5cGkub3JnCmh0dHBzOi8vZmlsZXMucHl0aG9uaG9zdGVkLm9yZwpodHRwczovL2RsLmdvb2dsZS5jb20KaHR0cHM6Ly9wYWNrYWdlcy5taWNyb3NvZnQuY29tCmh0dHBzOi8vY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9jb21tdW5pdHkuY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9ha2EubXMKaHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvd29ya2Vycy1zZGsKaHR0cHM6Ly9leGFtcGxlLmNvbQpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbQpsYXVuY2hlci1kb3dubG9hZC5henVycGlsb3QuY29tCmF6dXJwaWxvdC5jb20KYXBpLmNuYi5jb29sCmNuYi5jb29sCmxhdW5jaGVyLWNsb3VkZmxhcmUtY2RuLWRvd25sb2FkLmF6dXJwaWxvdC5jb20K"
+        run: |
+          printf '%s' "$AZURPILOT_LOG_MASK_B64" | openssl base64 -d -A | while IFS= read -r value; do
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+          done
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout backend at resolved revision
+        uses: actions/checkout@v4
+        with:
+          repository: wess09/AzurPilot
+          ref: ${{ needs.runtime-revision.outputs.revision }}
+          path: backend-source
+          persist-credentials: false
+      - name: Package git/adb components and deploy bootstrap manifest
+        shell: bash
+        env:
+          # GitHub API 请求携带令牌，规避 runner 共享 IP 的匿名限流（403）。
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python tools/build_components.py --source backend-source --output runtime-artifacts --platform '${{ matrix.platform }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.platform }}
+          path: runtime-artifacts/*
+          compression-level: 0
+          retention-days: 7
+
+  publish-runtime-components:
+    needs: runtime-components
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # 启动器发布也持有此锁。读取当前清单、合并、发布必须在同一临界区内。
+    concurrency:
+      group: launcher-stable-manifest
+      cancel-in-progress: false
+    env:
+      CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+      CNB_API: https://api.cnb.cool
+      CNB_REPO: AzurPilot/AzurPilotLauncher
+      CNB_RELEASE_TAG: "1.0.0"
+      CNB_CLI_VERSION: "1.2.3"
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WRANGLER_VERSION: "4.151.1"
+    steps:
+      # 日志脱敏：注册 URL 掩码清单（明文见 tools/ci/log-mask.txt；base64 藏在
+      # 环境变量里，避免本步骤自身的日志先出现 URL）。掩码对本 job 之后的全部
+      # 日志生效；修改清单后需重新 base64 并同步两个 workflow 的所有 job。
+      - name: Register log masks
+        shell: bash
+        env:
+          AZURPILOT_LOG_MASK_B64: "IyBDSSDml6Xlv5fmjqnnoIHmuIXljZXvvIjmmI7mlofln7rlh4bvvInjgIIKIyDmr4/kuKogam9iIOmmluatpeaKiuWug+mAkOihjOazqOWGjOS4uiA6OmFkZC1tYXNrOjrvvIxHaXRIdWIg5Lya5oqK5pel5b+X5Lit5ZG95Lit55qE5a2Q5Liy5pu/5o2i5Li6ICoqKuOAggojIOS/ruaUueWQjuaJp+ihjDogYmFzZTY0IC13MCDmnKzmlofku7bvvIjot7Pov4fms6jph4rooYzvvInvvIzmiorovpPlh7rlkIzmraXmm7/mjaIKIyAuZ2l0aHViL3dvcmtmbG93cy9wYWNrYWdlLnltbCDkuI4gdGVzdC55bWwg5Lit5omA5pyJIEFaVVJQSUxPVF9MT0dfTUFTS19CNjQg55qE5YC844CCCiMg5rOo5oSP77ya5pys5paH5Lu25LiN5Lya5Ye6546w5Zyo5pel5b+X6YeM77yI5o6p56CB5q2l6aqk5Y+q6L6T5Ye6IGFkZC1tYXNrIOWRveS7pO+8ie+8jOaUueWKqOivt+S/neaMgeavj+ihjOS4gOS4quWujOaVtOadoeebruOAgeS4jeimgeeVmeepuuihjOOAggpodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8uZXh0cmFoZWFkZXIKaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvc3RhYmxlLmpzb24KaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tL3VwZGF0YS9zdGFibGUuanNvbgpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tCmh0dHBzOi8vbGF1bmNoZXItZG93bmxvYWQuYXp1cnBpbG90LmNvbQpodHRwczovL2FwaS5jbmIuY29vbApodHRwczovL2NuYi5jb29sCmh0dHBzOi8vZ2l0aHViLmNvbS93ZXNzMDkvQXp1clBpbG90TGF1bmNoZXIKaHR0cHM6Ly9naXRodWIuY29tL3dlc3MwOS9BenVyUGlsb3QKaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbQpodHRwczovL3VwbG9hZHMuZ2l0aHViLmNvbQpodHRwczovL29iamVjdHMuZ2l0aHVidXNlcmNvbnRlbnQuY29tCmh0dHBzOi8vZG9jcy5naXRodWIuY29tCmh0dHBzOi8vZ2l0aHViLmNvbS9hc3RyYWwtc2gvc2V0dXAtdXYKaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2FzdHJhbC1zaC9zZXR1cC11dgpodHRwczovL2dpdGh1Yi5jb20vYXN0cmFsLXNoL3V2Cmh0dHBzOi8vYXN0cmFsLnNoCmh0dHBzOi8vZ2l0aHViLmNvbS9hY3Rpb25zL3B5dGhvbi12ZXJzaW9ucwpodHRwczovL2dpdGh1Yi5jb20vYWN0aW9ucy9zZXR1cC1weXRob24KaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvbm9kZS12ZXJzaW9ucwpodHRwczovL3N0YXRpYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vc2gucnVzdHVwLnJzCmh0dHBzOi8vY3JhdGVzLmlvCmh0dHBzOi8vaW5kZXguY3JhdGVzLmlvCmh0dHBzOi8vc3RhdGljLmNyYXRlcy5pbwpodHRwczovL2RvYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vZ2l0aHViLmNvbS9ydXN0LWxhbmcKaHR0cHM6Ly92Mi50YXVyaS5hcHAKaHR0cHM6Ly90YXVyaS5hcHAKaHR0cHM6Ly93d3cuaW5ub3NldHVwLmNvbQpodHRwczovL3JvbGx1cGpzLm9yZwpodHRwczovL3ZpdGUuZGV2Cmh0dHBzOi8vcmVnaXN0cnkubnBtanMub3JnCmh0dHBzOi8vZG9jcy5ucG1qcy5jb20KaHR0cHM6Ly9jbGkuZ2l0aHViLmNvbQpodHRwczovL3B5cGkub3JnCmh0dHBzOi8vZmlsZXMucHl0aG9uaG9zdGVkLm9yZwpodHRwczovL2RsLmdvb2dsZS5jb20KaHR0cHM6Ly9wYWNrYWdlcy5taWNyb3NvZnQuY29tCmh0dHBzOi8vY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9jb21tdW5pdHkuY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9ha2EubXMKaHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvd29ya2Vycy1zZGsKaHR0cHM6Ly9leGFtcGxlLmNvbQpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbQpsYXVuY2hlci1kb3dubG9hZC5henVycGlsb3QuY29tCmF6dXJwaWxvdC5jb20KYXBpLmNuYi5jb29sCmNuYi5jb29sCmxhdW5jaGVyLWNsb3VkZmxhcmUtY2RuLWRvd25sb2FkLmF6dXJwaWxvdC5jb20K"
+        run: |
+          printf '%s' "$AZURPILOT_LOG_MASK_B64" | openssl base64 -d -A | while IFS= read -r value; do
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+          done
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          merge-multiple: true
+          path: runtime-artifacts
+      - name: Validate complete runtime manifest
+        run: python tools/build_components.py --merge runtime-artifacts --output runtime-manifest.json
+      - name: Upload immutable component archives to GitHub
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view runtime >/dev/null 2>&1 || gh release create runtime --title 'Runtime components' --notes 'CI-built runtime archives. The manifest is published only in launcher stable.json.' --prerelease
+          shopt -s nullglob
+          files=(runtime-artifacts/component-*.zip)
+          existing="$(gh release view runtime --json assets --jq '.assets[].name')"
+          for file in "${files[@]}"; do
+            if grep -Fxq "$(basename "$file")" <<<"$existing"; then continue; fi
+            gh release upload runtime "$file"
+          done
+      - name: Upload immutable component archives to CNB
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CNB_TOKEN:?Set CNB_TOKEN secret}"
+          cli="${RUNNER_TEMP}/git-cnb"
+          auth=(-H "Authorization: token ${CNB_TOKEN}" -H 'Accept: application/vnd.cnb.api+json')
+          release_json="$(curl -fsS "${auth[@]}" "${CNB_API}/${CNB_REPO}/-/releases/tags/${CNB_RELEASE_TAG}")"
+          [[ -n "$(jq -r '.id // empty' <<<"$release_json")" ]]
+          shopt -s nullglob
+          for file in runtime-artifacts/component-*.zip; do
+            name="$(basename "$file")"
+            # 内容摘要进入文件名，存在即复用；保留旧组件供旧清单和修复任务下载。
+            if jq -e --arg name "$name" '.assets[]? | select(.name == $name)' <<<"$release_json" >/dev/null; then
+              continue
+            fi
+            if [[ ! -x "$cli" ]]; then
+              curl -fsSL "https://cnb.cool/looc/git-cnb/-/releases/download/${CNB_CLI_VERSION}/git-cnb_linux_amd64" -o "$cli"
+              chmod +x "$cli"
+            fi
+            "$cli" --repo="$CNB_REPO" release asset-upload -t "$CNB_RELEASE_TAG" -f "$file"
+          done
+      - name: Merge runtime into launcher stable.json and publish static assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest="$(git ls-remote https://github.com/wess09/AzurPilot.git refs/heads/master | cut -f1)"
+          python tools/merge_stable_manifest.py --runtime runtime-manifest.json --expected-revision "$latest" --output cf-worker/public/updata/stable.json
+          bash cf-worker/deploy.sh --message "runtime components ${GITHUB_RUN_ID}"
+      - name: Verify published runtime revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, sys, time, urllib.error
+          sys.path.insert(0, 'tools')
+          from merge_stable_manifest import fetch_manifest
+          expected = json.load(open('runtime-manifest.json'))
+          for attempt in range(10):
+              try:
+                  actual = fetch_manifest('https://launcher-api.azurpilot.com/updata/stable.json', timeout=15)
+                  if actual.get('runtime') == expected:
+                      break
+              except (urllib.error.URLError, OSError, ValueError):
+                  pass
+              print(f'Runtime manifest not visible yet (attempt {attempt + 1}/10)')
+              time.sleep(3)
+          else:
+              raise SystemExit('Published stable.json does not contain the expected runtime components')
+          PY
+
+  # 前端产物单点构建：四个平台 package job 共用同一份 dist（产物与平台
+  # 无关），避免 Windows ARM64 等平台重复执行缓慢的 npm 构建步骤。
+  frontend-dist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Register log masks
+        shell: bash
+        env:
+          AZURPILOT_LOG_MASK_B64: "IyBDSSDml6Xlv5fmjqnnoIHmuIXljZXvvIjmmI7mlofln7rlh4bvvInjgIIKIyDmr4/kuKogam9iIOmmluatpeaKiuWug+mAkOihjOazqOWGjOS4uiA6OmFkZC1tYXNrOjrvvIxHaXRIdWIg5Lya5oqK5pel5b+X5Lit5ZG95Lit55qE5a2Q5Liy5pu/5o2i5Li6ICoqKuOAggojIOS/ruaUueWQjuaJp+ihjDogYmFzZTY0IC13MCDmnKzmlofku7bvvIjot7Pov4fms6jph4rooYzvvInvvIzmiorovpPlh7rlkIzmraXmm7/mjaIKIyAuZ2l0aHViL3dvcmtmbG93cy9wYWNrYWdlLnltbCDkuI4gdGVzdC55bWwg5Lit5omA5pyJIEFaVVJQSUxPVF9MT0dfTUFTS19CNjQg55qE5YC844CCCiMg5rOo5oSP77ya5pys5paH5Lu25LiN5Lya5Ye6546w5Zyo5pel5b+X6YeM77yI5o6p56CB5q2l6aqk5Y+q6L6T5Ye6IGFkZC1tYXNrIOWRveS7pO+8ie+8jOaUueWKqOivt+S/neaMgeavj+ihjOS4gOS4quWujOaVtOadoeebruOAgeS4jeimgeeVmeepuuihjOOAggpodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8uZXh0cmFoZWFkZXIKaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvc3RhYmxlLmpzb24KaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tL3VwZGF0YS9zdGFibGUuanNvbgpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tCmh0dHBzOi8vbGF1bmNoZXItZG93bmxvYWQuYXp1cnBpbG90LmNvbQpodHRwczovL2FwaS5jbmIuY29vbApodHRwczovL2NuYi5jb29sCmh0dHBzOi8vZ2l0aHViLmNvbS93ZXNzMDkvQXp1clBpbG90TGF1bmNoZXIKaHR0cHM6Ly9naXRodWIuY29tL3dlc3MwOS9BenVyUGlsb3QKaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbQpodHRwczovL3VwbG9hZHMuZ2l0aHViLmNvbQpodHRwczovL29iamVjdHMuZ2l0aHVidXNlcmNvbnRlbnQuY29tCmh0dHBzOi8vZG9jcy5naXRodWIuY29tCmh0dHBzOi8vZ2l0aHViLmNvbS9hc3RyYWwtc2gvc2V0dXAtdXYKaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2FzdHJhbC1zaC9zZXR1cC11dgpodHRwczovL2dpdGh1Yi5jb20vYXN0cmFsLXNoL3V2Cmh0dHBzOi8vYXN0cmFsLnNoCmh0dHBzOi8vZ2l0aHViLmNvbS9hY3Rpb25zL3B5dGhvbi12ZXJzaW9ucwpodHRwczovL2dpdGh1Yi5jb20vYWN0aW9ucy9zZXR1cC1weXRob24KaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvbm9kZS12ZXJzaW9ucwpodHRwczovL3N0YXRpYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vc2gucnVzdHVwLnJzCmh0dHBzOi8vY3JhdGVzLmlvCmh0dHBzOi8vaW5kZXguY3JhdGVzLmlvCmh0dHBzOi8vc3RhdGljLmNyYXRlcy5pbwpodHRwczovL2RvYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vZ2l0aHViLmNvbS9ydXN0LWxhbmcKaHR0cHM6Ly92Mi50YXVyaS5hcHAKaHR0cHM6Ly90YXVyaS5hcHAKaHR0cHM6Ly93d3cuaW5ub3NldHVwLmNvbQpodHRwczovL3JvbGx1cGpzLm9yZwpodHRwczovL3ZpdGUuZGV2Cmh0dHBzOi8vcmVnaXN0cnkubnBtanMub3JnCmh0dHBzOi8vZG9jcy5ucG1qcy5jb20KaHR0cHM6Ly9jbGkuZ2l0aHViLmNvbQpodHRwczovL3B5cGkub3JnCmh0dHBzOi8vZmlsZXMucHl0aG9uaG9zdGVkLm9yZwpodHRwczovL2RsLmdvb2dsZS5jb20KaHR0cHM6Ly9wYWNrYWdlcy5taWNyb3NvZnQuY29tCmh0dHBzOi8vY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9jb21tdW5pdHkuY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9ha2EubXMKaHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvd29ya2Vycy1zZGsKaHR0cHM6Ly9leGFtcGxlLmNvbQpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbQpsYXVuY2hlci1kb3dubG9hZC5henVycGlsb3QuY29tCmF6dXJwaWxvdC5jb20KYXBpLmNuYi5jb29sCmNuYi5jb29sCmxhdW5jaGVyLWNsb3VkZmxhcmUtY2RuLWRvd25sb2FkLmF6dXJwaWxvdC5jb20K"
+        run: |
+          printf '%s' "$AZURPILOT_LOG_MASK_B64" | openssl base64 -d -A | while IFS= read -r value; do
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+          done
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build launcher UI
+        shell: bash
+        run: |
+          set -o pipefail
+          npm --prefix frontend ci 2>&1 | bash tools/ci/redact-urls.sh
+          npm --prefix frontend run build 2>&1 | bash tools/ci/redact-urls.sh
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 7
+
   package:
+    if: github.event_name != 'schedule' && github.event_name != 'repository_dispatch'
+    needs: [runtime-revision, frontend-dist]
+    outputs:
+      canary-version: ${{ steps.version.outputs.version }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -28,23 +279,36 @@ jobs:
         os: [ubuntu-22.04, macos-latest, windows-latest, windows-11-arm]
 
     steps:
+      # 日志脱敏：注册 URL 掩码清单（明文见 tools/ci/log-mask.txt；base64 藏在
+      # 环境变量里，避免本步骤自身的日志先出现 URL）。掩码对本 job 之后的全部
+      # 日志生效；修改清单后需重新 base64 并同步两个 workflow 的所有 job。
+      - name: Register log masks
+        shell: bash
+        env:
+          AZURPILOT_LOG_MASK_B64: "IyBDSSDml6Xlv5fmjqnnoIHmuIXljZXvvIjmmI7mlofln7rlh4bvvInjgIIKIyDmr4/kuKogam9iIOmmluatpeaKiuWug+mAkOihjOazqOWGjOS4uiA6OmFkZC1tYXNrOjrvvIxHaXRIdWIg5Lya5oqK5pel5b+X5Lit5ZG95Lit55qE5a2Q5Liy5pu/5o2i5Li6ICoqKuOAggojIOS/ruaUueWQjuaJp+ihjDogYmFzZTY0IC13MCDmnKzmlofku7bvvIjot7Pov4fms6jph4rooYzvvInvvIzmiorovpPlh7rlkIzmraXmm7/mjaIKIyAuZ2l0aHViL3dvcmtmbG93cy9wYWNrYWdlLnltbCDkuI4gdGVzdC55bWwg5Lit5omA5pyJIEFaVVJQSUxPVF9MT0dfTUFTS19CNjQg55qE5YC844CCCiMg5rOo5oSP77ya5pys5paH5Lu25LiN5Lya5Ye6546w5Zyo5pel5b+X6YeM77yI5o6p56CB5q2l6aqk5Y+q6L6T5Ye6IGFkZC1tYXNrIOWRveS7pO+8ie+8jOaUueWKqOivt+S/neaMgeavj+ihjOS4gOS4quWujOaVtOadoeebruOAgeS4jeimgeeVmeepuuihjOOAggpodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8uZXh0cmFoZWFkZXIKaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvc3RhYmxlLmpzb24KaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tL3VwZGF0YS9zdGFibGUuanNvbgpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tCmh0dHBzOi8vbGF1bmNoZXItZG93bmxvYWQuYXp1cnBpbG90LmNvbQpodHRwczovL2FwaS5jbmIuY29vbApodHRwczovL2NuYi5jb29sCmh0dHBzOi8vZ2l0aHViLmNvbS93ZXNzMDkvQXp1clBpbG90TGF1bmNoZXIKaHR0cHM6Ly9naXRodWIuY29tL3dlc3MwOS9BenVyUGlsb3QKaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbQpodHRwczovL3VwbG9hZHMuZ2l0aHViLmNvbQpodHRwczovL29iamVjdHMuZ2l0aHVidXNlcmNvbnRlbnQuY29tCmh0dHBzOi8vZG9jcy5naXRodWIuY29tCmh0dHBzOi8vZ2l0aHViLmNvbS9hc3RyYWwtc2gvc2V0dXAtdXYKaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2FzdHJhbC1zaC9zZXR1cC11dgpodHRwczovL2dpdGh1Yi5jb20vYXN0cmFsLXNoL3V2Cmh0dHBzOi8vYXN0cmFsLnNoCmh0dHBzOi8vZ2l0aHViLmNvbS9hY3Rpb25zL3B5dGhvbi12ZXJzaW9ucwpodHRwczovL2dpdGh1Yi5jb20vYWN0aW9ucy9zZXR1cC1weXRob24KaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvbm9kZS12ZXJzaW9ucwpodHRwczovL3N0YXRpYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vc2gucnVzdHVwLnJzCmh0dHBzOi8vY3JhdGVzLmlvCmh0dHBzOi8vaW5kZXguY3JhdGVzLmlvCmh0dHBzOi8vc3RhdGljLmNyYXRlcy5pbwpodHRwczovL2RvYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vZ2l0aHViLmNvbS9ydXN0LWxhbmcKaHR0cHM6Ly92Mi50YXVyaS5hcHAKaHR0cHM6Ly90YXVyaS5hcHAKaHR0cHM6Ly93d3cuaW5ub3NldHVwLmNvbQpodHRwczovL3JvbGx1cGpzLm9yZwpodHRwczovL3ZpdGUuZGV2Cmh0dHBzOi8vcmVnaXN0cnkubnBtanMub3JnCmh0dHBzOi8vZG9jcy5ucG1qcy5jb20KaHR0cHM6Ly9jbGkuZ2l0aHViLmNvbQpodHRwczovL3B5cGkub3JnCmh0dHBzOi8vZmlsZXMucHl0aG9uaG9zdGVkLm9yZwpodHRwczovL2RsLmdvb2dsZS5jb20KaHR0cHM6Ly9wYWNrYWdlcy5taWNyb3NvZnQuY29tCmh0dHBzOi8vY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9jb21tdW5pdHkuY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9ha2EubXMKaHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvd29ya2Vycy1zZGsKaHR0cHM6Ly9leGFtcGxlLmNvbQpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbQpsYXVuY2hlci1kb3dubG9hZC5henVycGlsb3QuY29tCmF6dXJwaWxvdC5jb20KYXBpLmNuYi5jb29sCmNuYi5jb29sCmxhdW5jaGVyLWNsb3VkZmxhcmUtY2RuLWRvd25sb2FkLmF6dXJwaWxvdC5jb20K"
+        run: |
+          printf '%s' "$AZURPILOT_LOG_MASK_B64" | openssl base64 -d -A | while IFS= read -r value; do
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+          done
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Tauri dependencies (Ubuntu only)
         if: ${{ startsWith(matrix.os, 'ubuntu-') }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - name: Get rdfind
-        uses: knicknic/os-specific-run@v1.0.3
+          set -o pipefail
+          {
+            sudo apt-get update
+            sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          } 2>&1 | bash tools/ci/redact-urls.sh
+      - name: Download shared frontend dist
+        uses: actions/download-artifact@v4
         with:
-          linux: sudo apt-get install -y rdfind
-          macos: brew install rdfind
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          version: ${{ env.UV_VERSION }}
+          name: frontend-dist
+          path: frontend/dist
       - name: Prepare version from tag or input
+        id: version
         shell: python
         env:
           REF_TYPE: ${{ github.ref_type }}
@@ -69,7 +333,21 @@ jobs:
           ref_type = os.environ.get("REF_TYPE", "")
           ref_name = os.environ.get("REF_NAME", "").strip()
           input_version = os.environ.get("INPUT_VERSION", "").strip()
-          version = ref_name if ref_type == "tag" else input_version or current_version
+          if ref_type == "tag":
+              version = ref_name
+          elif os.environ.get("GITHUB_EVENT_NAME") == "push":
+              # main 分支每次构建产金丝雀版本：
+              # Cargo 版本的 patch 加 1，例如 3.0.3 -> 3.0.4-canary.*。
+              core = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:[-+]|$)", current_version)
+              if not core:
+                  raise SystemExit("Unable to read version core from Cargo.toml")
+              major, minor, patch = map(int, core.groups())
+              import datetime as _datetime
+              stamp = _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+              commit = os.environ.get("GITHUB_SHA", "")[:8]
+              version = f"{major}.{minor}.{patch + 1}-canary.{commit}.{stamp}"
+          else:
+              version = input_version or current_version
 
           semver_pattern = re.compile(
               r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
@@ -111,7 +389,7 @@ jobs:
 
           lock_text = cargo_lock_path.read_text(encoding="utf-8")
           lock_updated, count = re.subn(
-              r'(?ms)(\[\[package\]\]\s+name = "alas-launcher"\s+version = ")[^"]+(")',
+              r'(?ms)(\[\[package\]\]\s+name = "azurpilot"\s+version = ")[^"]+(")',
               rf"\g<1>{version}\2",
               lock_text,
               count=1,
@@ -124,254 +402,60 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"version={version}\n")
           print(f"Building version {version}")
-      - name: Prepare bootstrap uv
-        uses: knicknic/os-specific-run@v1.0.3
-        with:
-          linux: |
-            mkdir -p bootstrap
-            cp "$(command -v uv)" bootstrap/uv
-            echo "ALAS_BOOTSTRAP_UV=$PWD/bootstrap/uv" >> "$GITHUB_ENV"
-          macos: |
-            mkdir -p bootstrap
-            cp "$(command -v uv)" bootstrap/uv
-            echo "ALAS_BOOTSTRAP_UV=$PWD/bootstrap/uv" >> "$GITHUB_ENV"
-          windows: |
-            mkdir -ea 0 bootstrap
-            cp (Get-Command uv).Source bootstrap\uv.exe
-            "ALAS_BOOTSTRAP_UV=$PWD\bootstrap\uv.exe" >> $env:GITHUB_ENV
       - name: Rustup for cache
         run: rustup toolchain install stable --profile minimal
+      - name: Install uv for bootstrap embedding
+        uses: astral-sh/setup-uv@v6
+      - name: Prepare embedded bootstrap uv
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bootstrap
+          cp "$(command -v uv)" bootstrap/uv
+          bootstrap_uv="$PWD/bootstrap/uv"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            bootstrap_uv="$(cygpath -m "$bootstrap_uv")"
+          fi
+          test -s "$bootstrap_uv"
+          echo "AZURPILOT_BOOTSTRAP_UV=$bootstrap_uv" >> "$GITHUB_ENV"
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # Keep native dependency artifacts separate for each runner image/CPU.
+          shared-key: release-${{ matrix.os }}-${{ runner.arch }}
+          cache-bin: false
       - name: Build
         env:
-          ALAS_LAUNCHER_MTLS_IDENTITY_PEM_B64: ${{ secrets.ALAS_LAUNCHER_MTLS_IDENTITY_PEM_B64 }}
+          # Prefer the new Secret name while keeping existing release credentials usable.
+          AZURPILOT_LAUNCHER_MTLS_IDENTITY_PEM_B64: ${{ secrets.AZURPILOT_LAUNCHER_MTLS_IDENTITY_PEM_B64 || secrets.ALAS_LAUNCHER_MTLS_IDENTITY_PEM_B64 }}
           REQUIRE_LAUNCHER_MTLS_IDENTITY: "1"
-          LAUNCHER_UPDATE_URL: https://ap-launcher-update.nanoda.work/updata/stable.json
-        run: cargo build --verbose --release
-      - name: Get git
-        uses: knicknic/os-specific-run@v1.0.3
-        with:
-          linux: |
-            git clone https://github.com/git/git.git --branch v2.49.1 --depth 1
-            cd git
-            echo NO_GETTEXT=1 > config.mak
-            cat > conanfile.txt <<CONANFILE
-            [requires]
-            openssl/3.4.1
-            libcurl/8.12.1
-            expat/2.7.1
-            pcre2/10.44
-            [generators]
-            AutotoolsDeps
-            AutotoolsToolchain
-            PkgConfigDeps
-            CONANFILE
-            container_id=$(docker run -d -v $PWD:/volume --rm -t quay.io/pypa/manylinux2010_x86_64:latest)
-            docker exec -w /volume -t $container_id yum update
-            docker exec -w /volume -t $container_id yum install -y gettext perl-IPC-Cmd perl-Digest-SHA
-            docker exec -w /volume -t $container_id pipx install conan
-            docker exec -w /volume -t $container_id conan profile detect --force
-            docker exec -w /volume -t $container_id conan install . --build=missing --build="m4*"
-            docker exec -w /volume -t $container_id make configure
-            docker exec -w /volume -t $container_id bash -c 'source conanbuild.sh; \
-              export RUNTIME_PREFIX=1
-              export CURL_CONFIG="pkg-config libcurl"
-              LDFLAGS+=" $LIBS"
-              export LDFLAGS
-              ./configure --with-openssl --with-curl --with-expat --without-tcltk --prefix=/; \
-              make -j$(nproc) RUNTIME_PREFIX=1 CURL_CONFIG="$CURL_CONFIG" install DESTDIR=/volume/dist'
-            sudo chown -R $USER:$USER .
-          macos: |
-            brew install autoconf
-            git clone https://github.com/git/git.git --branch v2.49.1 --depth 1
-            cd git
-            echo NO_GETTEXT=1 > config.mak
-            make configure
-            ./configure --with-openssl --with-curl --with-expat --without-tcltk --prefix=/
-            make -j$(sysctl -n hw.logicalcpu) RUNTIME_PREFIX=1 install DESTDIR=$PWD/dist
-          windows: |
-            curl -L -O https://github.com/brechtsanders/pedeps/releases/download/0.1.15/pedeps-0.1.15-win64.zip
-            mkdir -p pedeps
-            unzip pedeps-0.1.15-win64.zip -d pedeps/
-            curl -L -O https://github.com/git-for-windows/git/releases/download/v2.51.0.windows.2/MinGit-2.51.0.2-busybox-64-bit.zip
-            mkdir git
-            cd git
-            tar -xvf ..\MinGit-2.51.0.2-busybox-64-bit.zip
-      - name: Get adb
-        uses: knicknic/os-specific-run@v1.0.3
-        with:
-          macos: |
-            curl -L -o adb.zip https://dl.google.com/android/repository/platform-tools-latest-darwin.zip
-            unzip adb.zip
-          linux: |
-            curl -L -o adb.zip https://dl.google.com/android/repository/platform-tools-latest-linux.zip
-            unzip adb.zip
-          windows: |
-            curl -L -o adb.zip https://dl.google.com/android/repository/platform-tools-latest-windows.zip
-            tar -xvf adb.zip
-      - name: Get AzurPilot
-        run: |
-          git clone --depth=1 --filter=blob:none --sparse https://github.com/wess09/AzurPilot.git AzurLaneAutoScript
-          git -C AzurLaneAutoScript sparse-checkout set deploy
-      - name: Distribute
-        uses: knicknic/os-specific-run@v1.0.3
-        with:
-          macos: |
-            set -eux
-            rm -rf package-root AzurPilot.app
-            mkdir -p package-root/AzurLaneAutoScript
-            ditto AzurLaneAutoScript/deploy package-root/AzurLaneAutoScript/deploy
-
-            cd package-root/AzurLaneAutoScript
-            mkdir -p config .venv/bin bootstrap
-            cp ../../deploy.mac.yaml config/deploy.yaml
-            export UV_PYTHON_INSTALL_DIR="$PWD/.venv/python"
-            uv python install --install-dir .venv/python --no-bin --managed-python 3.14.6
-            python_home="$(find .venv/python -maxdepth 1 -type d -name 'cpython-3.14.6-*' | head -n1)"
-            uv venv --allow-existing --relocatable --python "$python_home/bin/python3.14" .venv
-            uv pip install --python .venv/bin/python requests
-            cp ../../bootstrap/uv .venv/bin/uv
-            cp ../../platform-tools/adb .venv/bin/adb
-            mkdir -p .venv/libexec
-            cp -R ../../git/dist/libexec/git-core .venv/libexec/
-            mkdir -p .venv/share/git-core
-            cp -R ../../git/dist/share/git-core/templates .venv/share/git-core/
-            cp ../../git/dist/bin/git .venv/bin/git
-            test -x .venv/libexec/git-core/git-remote-https
-            cp .venv/bin/adb bootstrap/adb
-            cp -R .venv/libexec/git-core bootstrap/
-            cp -R .venv/share/git-core/templates bootstrap/git-templates
-            cp .venv/bin/git bootstrap/git
-            chmod +x .venv/bin/uv .venv/bin/adb .venv/bin/git
-            .venv/bin/python -c 'import sys; print(sys.version)'
-            .venv/bin/uv --version
-            .venv/bin/adb version
-            .venv/bin/git --version
-            GIT_EXEC_PATH="$PWD/.venv/libexec/git-core" GIT_TEMPLATE_DIR="$PWD/.venv/share/git-core/templates" .venv/bin/git init git-smoke
-            GIT_EXEC_PATH="$PWD/.venv/libexec/git-core" GIT_TEMPLATE_DIR="$PWD/.venv/share/git-core/templates" .venv/bin/git ls-remote https://github.com/git/git.git HEAD
-
-            cd ${{ github.workspace }}
-            mkdir -p AzurPilot.app/Contents/MacOS
-            cp target/release/alas-launcher AzurPilot.app/Contents/MacOS/
-            mkdir -p AzurPilot.app/Contents/Resources
-            cp icons/icon.icns AzurPilot.app/Contents/Resources/
-            ditto package-root/AzurLaneAutoScript AzurPilot.app/Contents/AzurLaneAutoScript
-            cp Info.plist AzurPilot.app/Contents/
-            rdfind -minsize 128 -makehardlinks true AzurPilot.app
-            uv run python - <<EOF
-            import tarfile, lzma
-            with tarfile.open('AP-${{ runner.os }}-$(uname -m).tar.xz', 'x:xz', preset=9|lzma.PRESET_EXTREME) as t:
-              t.add('AzurPilot.app')
-            EOF
-
-            cp deploy.mac-cn.yaml AzurPilot.app/Contents/AzurLaneAutoScript/config/deploy.yaml
-            uv run python - <<EOF
-            import tarfile, lzma
-            with tarfile.open('AP-CN-${{ runner.os }}-$(uname -m).tar.xz', 'x:xz', preset=9|lzma.PRESET_EXTREME) as t:
-              t.add('AzurPilot.app')
-            EOF
-          linux: |
-            set -eux
-            rm -rf package-root
-            mkdir -p package-root/AzurLaneAutoScript
-            cp -a AzurLaneAutoScript/deploy package-root/AzurLaneAutoScript/deploy
-
-            cd package-root/AzurLaneAutoScript
-            mkdir -p config .venv/bin bootstrap
-            cp ../../deploy.unix.yaml config/deploy.yaml
-            export UV_PYTHON_INSTALL_DIR="$PWD/.venv/python"
-            uv python install --install-dir .venv/python --no-bin --managed-python 3.14.6
-            python_home="$(find .venv/python -maxdepth 1 -type d -name 'cpython-3.14.6-*' | head -n1)"
-            uv venv --allow-existing --relocatable --python "$python_home/bin/python3.14" .venv
-            uv pip install --python .venv/bin/python requests
-            cp ../../bootstrap/uv .venv/bin/uv
-            cp ../../platform-tools/adb .venv/bin/adb
-            mkdir -p .venv/libexec
-            cp -R ../../git/dist/libexec/git-core .venv/libexec/
-            mkdir -p .venv/share/git-core
-            cp -R ../../git/dist/share/git-core/templates .venv/share/git-core/
-            cp ../../git/dist/bin/git .venv/bin/git
-            test -x .venv/libexec/git-core/git-remote-https
-            cp .venv/bin/adb bootstrap/adb
-            cp -R .venv/libexec/git-core bootstrap/
-            cp -R .venv/share/git-core/templates bootstrap/git-templates
-            cp .venv/bin/git bootstrap/git
-            chmod +x .venv/bin/uv .venv/bin/adb .venv/bin/git
-            cp ../../target/release/alas-launcher alas-launcher
-            .venv/bin/python -c 'import sys; print(sys.version)'
-            .venv/bin/uv --version
-            .venv/bin/adb version
-            .venv/bin/git --version
-            GIT_EXEC_PATH="$PWD/.venv/libexec/git-core" GIT_TEMPLATE_DIR="$PWD/.venv/share/git-core/templates" .venv/bin/git init git-smoke
-            GIT_EXEC_PATH="$PWD/.venv/libexec/git-core" GIT_TEMPLATE_DIR="$PWD/.venv/share/git-core/templates" GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt .venv/bin/git ls-remote https://github.com/git/git.git HEAD
-
-            cd ${{ github.workspace }}
-            rdfind -minsize 128 -makehardlinks true package-root/AzurLaneAutoScript
-            uv run python - <<EOF
-            import tarfile, lzma
-            with tarfile.open('AP-${{ runner.os }}-$(uname -m).tar.xz', 'x:xz', preset=9|lzma.PRESET_EXTREME) as t:
-              t.add('package-root/AzurLaneAutoScript', arcname='AzurLaneAutoScript')
-            EOF
-
-            cp deploy.unix-cn.yaml package-root/AzurLaneAutoScript/config/deploy.yaml
-            uv run python - <<EOF
-            import tarfile, lzma
-            with tarfile.open('AP-CN-${{ runner.os }}-$(uname -m).tar.xz', 'x:xz', preset=9|lzma.PRESET_EXTREME) as t:
-              t.add('package-root/AzurLaneAutoScript', arcname='AzurLaneAutoScript')
-            EOF
-          windows: |
-            rm -r -fo package-root -ErrorAction SilentlyContinue
-            mkdir -ea 0 package-root\AzurLaneAutoScript
-            cp -r AzurLaneAutoScript\deploy package-root\AzurLaneAutoScript\deploy
-
-            cd package-root\AzurLaneAutoScript
-            mkdir -ea 0 config
-            mkdir -ea 0 bootstrap
-            cp ..\..\deploy.windows.yaml config\deploy.yaml
-            $env:UV_PYTHON_INSTALL_DIR = "$PWD\.venv\python"
-            uv python install --install-dir .venv\python --no-bin --managed-python 3.14.6
-            $python_home = Get-ChildItem .venv\python -Directory | Where-Object { $_.Name -like "cpython-3.14.6-*" } | Select-Object -First 1
-            uv venv --allow-existing --relocatable --python "$($python_home.FullName)\python.exe" .venv
-            uv pip install --python .venv\Scripts\python.exe requests
-            cp ..\..\bootstrap\uv.exe .venv\Scripts\uv.exe
-            cp ..\..\platform-tools\adb.exe .venv\Scripts\adb.exe
-            cp ..\..\platform-tools\Adb*.dll .venv\Scripts\
-            mkdir -ea 0 .venv\Scripts\git\cmd
-            cp ..\..\git\cmd\git.exe .venv\Scripts\git\cmd\
-            mkdir -ea 0 .venv\Scripts\git\mingw64\bin
-            $git_files = @("git.exe","git-remote-http.exe","git-remote-https.exe","libcurl-4.dll") | ForEach-Object { "..\..\git\mingw64\bin\" + $_ }
-            ..\..\pedeps\bin\copypedeps.exe -r $git_files .venv\Scripts\git\mingw64\bin\
-            cp .venv\Scripts\adb.exe bootstrap\adb.exe
-            cp .venv\Scripts\Adb*.dll bootstrap\
-            mkdir -ea 0 bootstrap\git
-            cp -r .venv\Scripts\git\* bootstrap\git\
-            cp ..\..\target\release\alas-launcher.exe alas-launcher.exe
-            .venv\Scripts\python.exe -c "import sys; print(sys.version)"
-            .venv\Scripts\uv.exe --version
-            .venv\Scripts\adb.exe version
-            .venv\Scripts\git\cmd\git.exe --version
-
-            cd ${{ github.workspace }}
-            uv run python -c @"
-            import tarfile, lzma
-            with tarfile.open('AzurLaneAutoScript-${{ runner.os }}-$($env:PROCESSOR_ARCHITECTURE.ToLower()).tar.xz', 'x:xz', preset=9|lzma.PRESET_EXTREME) as t:
-              t.add('package-root/AzurLaneAutoScript', arcname='AzurLaneAutoScript')
-            "@
-
-            cp deploy.windows-cn.yaml package-root\AzurLaneAutoScript\config\deploy.yaml
-            uv run python -c @"
-            import tarfile, lzma
-            with tarfile.open('AzurLaneAutoScript-CN-${{ runner.os }}-$($env:PROCESSOR_ARCHITECTURE.ToLower()).tar.xz', 'x:xz', preset=9|lzma.PRESET_EXTREME) as t:
-              t.add('package-root/AzurLaneAutoScript', arcname='AzurLaneAutoScript')
-            "@
-      - name: Install Inno Setup (Windows x64 only)
-        if: matrix.os == 'windows-latest'
-        run: choco install innosetup --no-progress -y
-      - name: Build Windows installer (Windows x64 only)
-        if: matrix.os == 'windows-latest'
+        run: cargo build --locked --release --features custom-protocol
+      - name: Sign and verify Windows launcher
+        if: runner.os == 'Windows' && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
         shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_B64: ${{ secrets.WINDOWS_SIGNING_PFX_B64 }}
+          WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+          WINDOWS_SIGNING_ALLOW_SELF_SIGNED: ${{ vars.WINDOWS_SIGNING_ALLOW_SELF_SIGNED || 'false' }}
+        run: ./tools/ci/sign-windows.ps1 -Path target/release/azurpilot.exe
+      - name: Package standalone launcher
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        run: python tools/package_launcher.py
+      - name: Install Inno Setup (Windows x64 only)
+        if: matrix.os == 'windows-latest' && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
+        shell: bash
         run: |
+          set -o pipefail
+          choco install innosetup --no-progress --limit-output -y 2>&1 | bash tools/ci/redact-urls.sh
+      - name: Build Windows installer (Windows x64 only)
+        if: matrix.os == 'windows-latest' && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_B64: ${{ secrets.WINDOWS_SIGNING_PFX_B64 }}
+          WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+          WINDOWS_SIGNING_ALLOW_SELF_SIGNED: ${{ vars.WINDOWS_SIGNING_ALLOW_SELF_SIGNED || 'false' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
           $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
           if (-not $iscc) {
             $candidates = @(
@@ -385,12 +469,18 @@ jobs:
           if (-not $iscc) {
             throw "ISCC.exe was not found after installing Inno Setup"
           }
+          $signingScript = (Resolve-Path tools/ci/sign-windows.ps1).Path
+          $signingCommand = 'pwsh.exe -NoProfile -NonInteractive -File $q' + $signingScript + '$q -Path $f'
           & $iscc install.iss `
+            '/DCodeSigning' `
+            "/Sazurpilot=$signingCommand" `
             "/DAppVersion=$env:PACKAGE_VERSION" `
             "/DOutputBaseFilename=AzurPilot_Setup_$env:PACKAGE_VERSION" `
-            "/DPackageRoot=package-root\AzurLaneAutoScript" `
+            "/DPackageRoot=package-root\AzurPilot" `
             "/DSetupRoot=setup"
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation or code signing failed.' }
       - name: Prepare launcher updater payload
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
         uses: knicknic/os-specific-run@v1.0.3
         with:
           linux: |
@@ -403,7 +493,7 @@ jobs:
               *) echo "Unsupported architecture: $arch"; exit 1 ;;
             esac
             mkdir -p launcher-updater
-            cp target/release/alas-launcher "launcher-updater/alas-launcher-linux-$arch_key"
+            cp target/release/azurpilot "launcher-updater/azurpilot-linux-$arch_key"
           macos: |
             arch=$(uname -m)
             case "$arch" in
@@ -412,33 +502,39 @@ jobs:
               *) echo "Unsupported architecture: $arch"; exit 1 ;;
             esac
             mkdir -p launcher-updater
-            cp target/release/alas-launcher "launcher-updater/alas-launcher-darwin-$arch_key"
+            cp target/release/azurpilot "launcher-updater/azurpilot-darwin-$arch_key"
           windows: |
             $arch = $env:PROCESSOR_ARCHITECTURE.ToLower()
             if ($arch -eq "amd64") { $arch = "x86_64" }
             elseif ($arch -eq "x86") { $arch = "i686" }
             elseif ($arch -eq "arm64") { $arch = "aarch64" }
             mkdir -ea 0 launcher-updater
-            cp target\release\alas-launcher.exe ("launcher-updater\\alas-launcher-windows-" + $arch + ".exe")
+            cp target\release\azurpilot.exe ("launcher-updater\\azurpilot-windows-" + $arch + ".exe")
       - name: Upload launcher updater payload
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: launcher-updater-${{ matrix.os }}
+          compression-level: 0
           path: launcher-updater/*
       - name: Upload artifacts
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: package-${{ matrix.os }}
+          compression-level: 0
           path: |
-            AzurLaneAutoScript-${{ runner.os }}-*
+            AzurPilot-${{ runner.os }}-*
             AP-${{ runner.os }}-*
             AzurPilot_Setup_*.exe
       - name: Upload artifacts (CN)
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: package-CN-${{ matrix.os }}
+          compression-level: 0
           path: |
-            AzurLaneAutoScript-CN-${{ runner.os }}-*
+            AzurPilot-CN-${{ runner.os }}-*
             AP-CN-${{ runner.os }}-*
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -446,128 +542,129 @@ jobs:
         with:
           prerelease: false
           files: |
-            AzurLaneAutoScript-${{ runner.os }}-*
-            AzurLaneAutoScript-CN-${{ runner.os }}-*
+            AzurPilot-${{ runner.os }}-*
+            AzurPilot-CN-${{ runner.os }}-*
             AP-${{ runner.os }}-*
             AP-CN-${{ runner.os }}-*
             AzurPilot_Setup_*.exe
+      - name: Upload canary payloads to GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view canary >/dev/null 2>&1 || gh release create canary \
+            --title 'Canary builds' --notes 'Rolling canary builds from main.' --prerelease
+          shopt -s nullglob
+          files=(launcher-updater/azurpilot-*)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no canary payloads found" >&2; exit 1; }
+          gh release upload canary "${files[@]}" --clobber
 
-  deploy-launcher-update-legacy:
-    if: github.ref_type == 'tag'
-    needs: package
+  # 一次性修复：给线上 stable.json 各平台补齐 cnb_url/gitcode_url 真实直链。
+  # 不改 payload/tag/Release，其余字段原样保留。
+  repair-launcher-urls:
+    if: github.event_name == 'workflow_dispatch' && inputs.repair_urls
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
-      UPDATE_BASE_URL: https://alas.nanoda.work/updata
+      MANIFEST_URL: https://launcher-api.azurpilot.com/updata/stable.json
     steps:
-      - name: Download launcher updater payloads
-        uses: actions/download-artifact@v4
-        with:
-          pattern: launcher-updater-*
-          merge-multiple: true
-          path: launcher-updater
-      - name: Build stable.json
+      - name: Register log masks
+        shell: bash
         env:
-          VERSION: ${{ github.ref_name }}
+          AZURPILOT_LOG_MASK_B64: "IyBDSSDml6Xlv5fmjqnnoIHmuIXljZXvvIjmmI7mlofln7rlh4bvvInjgIIKIyDmr4/kuKogam9iIOmmluatpeaKiuWug+mAkOihjOazqOWGjOS4uiA6OmFkZC1tYXNrOjrvvIxHaXRIdWIg5Lya5oqK5pel5b+X5Lit5ZG95Lit55qE5a2Q5Liy5pu/5o2i5Li6ICoqKuOAggojIOS/ruaUueWQjuaJp+ihjDogYmFzZTY0IC13MCDmnKzmlofku7bvvIjot7Pov4fms6jph4rooYzvvInvvIzmiorovpPlh7rlkIzmraXmm7/mjaIKIyAuZ2l0aHViL3dvcmtmbG93cy9wYWNrYWdlLnltbCDkuI4gdGVzdC55bWwg5Lit5omA5pyJIEFaVVJQSUxPVF9MT0dfTUFTS19CNjQg55qE5YC844CCCiMg5rOo5oSP77ya5pys5paH5Lu25LiN5Lya5Ye6546w5Zyo5pel5b+X6YeM77yI5o6p56CB5q2l6aqk5Y+q6L6T5Ye6IGFkZC1tYXNrIOWRveS7pO+8ie+8jOaUueWKqOivt+S/neaMgeavj+ihjOS4gOS4quWujOaVtOadoeebruOAgeS4jeimgeeVmeepuuihjOOAggpodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8uZXh0cmFoZWFkZXIKaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvc3RhYmxlLmpzb24KaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tL3VwZGF0YS9zdGFibGUuanNvbgpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tCmh0dHBzOi8vbGF1bmNoZXItZG93bmxvYWQuYXp1cnBpbG90LmNvbQpodHRwczovL2FwaS5jbmIuY29vbApodHRwczovL2NuYi5jb29sCmh0dHBzOi8vZ2l0aHViLmNvbS93ZXNzMDkvQXp1clBpbG90TGF1bmNoZXIKaHR0cHM6Ly9naXRodWIuY29tL3dlc3MwOS9BenVyUGlsb3QKaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbQpodHRwczovL3VwbG9hZHMuZ2l0aHViLmNvbQpodHRwczovL29iamVjdHMuZ2l0aHVidXNlcmNvbnRlbnQuY29tCmh0dHBzOi8vZG9jcy5naXRodWIuY29tCmh0dHBzOi8vZ2l0aHViLmNvbS9hc3RyYWwtc2gvc2V0dXAtdXYKaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2FzdHJhbC1zaC9zZXR1cC11dgpodHRwczovL2dpdGh1Yi5jb20vYXN0cmFsLXNoL3V2Cmh0dHBzOi8vYXN0cmFsLnNoCmh0dHBzOi8vZ2l0aHViLmNvbS9hY3Rpb25zL3B5dGhvbi12ZXJzaW9ucwpodHRwczovL2dpdGh1Yi5jb20vYWN0aW9ucy9zZXR1cC1weXRob24KaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvbm9kZS12ZXJzaW9ucwpodHRwczovL3N0YXRpYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vc2gucnVzdHVwLnJzCmh0dHBzOi8vY3JhdGVzLmlvCmh0dHBzOi8vaW5kZXguY3JhdGVzLmlvCmh0dHBzOi8vc3RhdGljLmNyYXRlcy5pbwpodHRwczovL2RvYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vZ2l0aHViLmNvbS9ydXN0LWxhbmcKaHR0cHM6Ly92Mi50YXVyaS5hcHAKaHR0cHM6Ly90YXVyaS5hcHAKaHR0cHM6Ly93d3cuaW5ub3NldHVwLmNvbQpodHRwczovL3JvbGx1cGpzLm9yZwpodHRwczovL3ZpdGUuZGV2Cmh0dHBzOi8vcmVnaXN0cnkubnBtanMub3JnCmh0dHBzOi8vZG9jcy5ucG1qcy5jb20KaHR0cHM6Ly9jbGkuZ2l0aHViLmNvbQpodHRwczovL3B5cGkub3JnCmh0dHBzOi8vZmlsZXMucHl0aG9uaG9zdGVkLm9yZwpodHRwczovL2RsLmdvb2dsZS5jb20KaHR0cHM6Ly9wYWNrYWdlcy5taWNyb3NvZnQuY29tCmh0dHBzOi8vY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9jb21tdW5pdHkuY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9ha2EubXMKaHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvd29ya2Vycy1zZGsKaHR0cHM6Ly9leGFtcGxlLmNvbQpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbQpsYXVuY2hlci1kb3dubG9hZC5henVycGlsb3QuY29tCmF6dXJwaWxvdC5jb20KYXBpLmNuYi5jb29sCmNuYi5jb29sCmxhdW5jaGVyLWNsb3VkZmxhcmUtY2RuLWRvd25sb2FkLmF6dXJwaWxvdC5jb20K"
         run: |
-          python - <<'PY'
-          import datetime
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-
-          base_url = os.environ["UPDATE_BASE_URL"].rstrip("/")
-          version = os.environ["VERSION"].strip()
-          if version.startswith("v"):
-              version = version[1:]
-
-          root = Path("launcher-updater")
-          files = sorted(
-              p for p in root.glob("alas-launcher-*")
-              if p.is_file() and p.name != "stable.json"
-          )
-          if not files:
-              raise SystemExit("No launcher payloads found in launcher-updater/")
-
-          platforms = {}
-          for file_path in files:
-              name = file_path.name
-              key = name[len("alas-launcher-"):]
-              if key.endswith(".exe"):
-                  key = key[:-4]
-              url_name = name
-              if name == "alas-launcher-windows-x86_64.exe":
-                  url_name = "alas-launcher.exe"
-              digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
-              platforms[key] = {
-                  "url": f"{base_url}/{url_name}",
-                  "sha256": digest,
-              }
-
-          manifest = {
-              "version": version,
-              "pub_date": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
-              "notes": f"Launcher auto update {version}",
-              "platforms": platforms,
-          }
-          (root / "stable.json").write_text(
-              json.dumps(manifest, ensure_ascii=False, indent=2),
-              encoding="utf-8",
-          )
-          print(json.dumps(manifest, ensure_ascii=False, indent=2))
-          PY
-      - name: Setup SSH key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
-      - name: Trust deployment host
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -p "${{ secrets.DEPLOY_PORT }}" "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
-      - name: Upload updater files to OpenResty path
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_PATH: /opt/1panel/www/sites/alas.nanoda.work/index/updata
-        run: |
-          set -eu
-          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
-          INCOMING="${DEPLOY_PATH}/.incoming-${GITHUB_RUN_ID}"
-          UPLOAD_DIR="launcher-updater-upload"
-          rm -rf "${UPLOAD_DIR}"
-          mkdir -p "${UPLOAD_DIR}"
-          for file in launcher-updater/alas-launcher-*; do
-            [ -f "${file}" ] || continue
-            filename="$(basename "${file}")"
-            remote_name="${filename}"
-            if [[ "${filename}" == "alas-launcher-windows-x86_64.exe" ]]; then
-              remote_name="alas-launcher.exe"
-            fi
-            cp "${file}" "${UPLOAD_DIR}/${remote_name}"
+          printf '%s' "$AZURPILOT_LOG_MASK_B64" | openssl base64 -d -A | while IFS= read -r value; do
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
           done
-          cp launcher-updater/stable.json "${UPLOAD_DIR}/stable.json"
-          ARCHIVE="launcher-updater-upload.tar.gz"
-          PARTS_DIR="launcher-updater-upload-parts"
-          rm -rf "${ARCHIVE}" "${PARTS_DIR}"
-          tar -C "${UPLOAD_DIR}" -cf - . | gzip -1 > "${ARCHIVE}"
-          mkdir -p "${PARTS_DIR}"
-          split -b 4m -d -a 4 "${ARCHIVE}" "${PARTS_DIR}/part-"
-          ssh -p "${DEPLOY_PORT}" "${REMOTE}" "rm -rf '${INCOMING}' && mkdir -p '${DEPLOY_PATH}' '${INCOMING}/parts' '${INCOMING}/unpack'"
-          find "${PARTS_DIR}" -type f -name 'part-*' -print0 \
-            | xargs -0 -P 8 -I {} sh -c 'part="$1"; scp -q -P "$2" "$part" "$3:$4/parts/$(basename "$part")"' sh "{}" "${DEPLOY_PORT}" "${REMOTE}" "${INCOMING}"
-          ssh -p "${DEPLOY_PORT}" "${REMOTE}" "set -eu
-            cat '${INCOMING}/parts'/part-* | gzip -d | tar -C '${INCOMING}/unpack' -xf -
-          "
-          ssh -p "${DEPLOY_PORT}" "${REMOTE}" "set -eu
-            find '${INCOMING}/unpack' -maxdepth 1 -type f ! -name 'stable.json' -exec mv -f {} '${DEPLOY_PATH}/' \;
-            mv -f '${INCOMING}/unpack/stable.json' '${DEPLOY_PATH}/stable.json'
-            rm -rf '${INCOMING}'
-          "
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Add CNB and GitCode direct urls
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cf-worker/public/updata
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AZURPILOT_LAUNCHER_UPDATE"
+          curl -fsSL -A "$UA" "$MANIFEST_URL" -o cf-worker/public/updata/stable.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          CNB_BASE = "https://cnb.cool/AzurPilot/AzurPilotLauncher/-/releases/download/1.0.0"
+          GITCODE_BASE = "https://gitcode.com/ddl2/assets/releases/download/1.0.0"
+          path = Path("cf-worker/public/updata/stable.json")
+          manifest = json.loads(path.read_text(encoding="utf-8"))
+
+          def fix(payloads, version):
+              changed = 0
+              for key, payload in (payloads or {}).items():
+                  # 从清单现有 url 的末段推出带版本号的载荷文件名。
+                  name = urlsplit(payload.get("url", "")).path.rsplit("/", 1)[-1]
+                  if not name:
+                      continue
+                  cnb = f"{CNB_BASE}/{name}"
+                  gitcode = f"{GITCODE_BASE}/{name}"
+                  if payload.get("cnb_url") != cnb:
+                      payload["cnb_url"] = cnb
+                      changed += 1
+                  if payload.get("gitcode_url") != gitcode:
+                      payload["gitcode_url"] = gitcode
+                      changed += 1
+                  # sha256 统一放到最后：摘出再插回，保证与其他 URL 字段顺序一致。
+                  digest = payload.pop("sha256", None)
+                  if digest is not None:
+                      payload["sha256"] = digest
+                  print(f"  {key}: cnb_url={cnb} gitcode_url={gitcode}")
+              return changed
+
+          total = fix(manifest.get("platforms"), manifest.get("version"))
+          canary = manifest.get("canary")
+          if canary:
+              total += fix(canary.get("platforms"), canary.get("version"))
+          path.write_text(json.dumps(manifest, ensure_ascii=False, separators=(',', ':')), encoding="utf-8")
+          print(f"Added {total} launcher direct url field(s); wrote minified JSON")
+          PY
+      - name: Publish stable.json to Cloudflare Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+            echo "::error::缺少 CLOUDFLARE_API_TOKEN 或 CLOUDFLARE_ACCOUNT_ID，无法发布 stable.json" >&2
+            exit 1
+          fi
+          bash cf-worker/deploy.sh --message "repair launcher url host"
+      - name: Verify Worker serves CNB and GitCode direct urls
+        shell: bash
+        run: |
+          set -euo pipefail
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AZURPILOT_LAUNCHER_UPDATE"
+          for attempt in $(seq 1 10); do
+            if curl -fsSL -A "$UA" --max-time 15 "$MANIFEST_URL" -o /tmp/stable.json \
+              && python3 -c 'import json,sys; d=json.load(open("/tmp/stable.json", encoding="utf-8")); bad=[k for k,v in (d.get("platforms") or {}).items() if "cnb.cool/" not in (v.get("cnb_url") or "") or "gitcode.com/" not in (v.get("gitcode_url") or "")]; sys.exit(1 if bad else 0)'; then
+              echo "Worker is serving CNB/GitCode direct urls"
+              exit 0
+            fi
+            echo "not updated yet (attempt ${attempt}/10), retrying..."
+            sleep 3
+          done
+          echo "::error::Worker still lacks CNB/GitCode direct urls" >&2
+          exit 1
 
   deploy-launcher-update:
-    if: github.ref_type == 'tag'
-    needs: package
+    if: github.ref_type == 'tag' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [package, publish-runtime-components]
+    permissions:
+      contents: write
+    concurrency:
+      group: launcher-stable-manifest
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     env:
       R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
@@ -577,10 +674,37 @@ jobs:
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_PREFIX: ${{ secrets.R2_PREFIX }}
       R2_REGION: ${{ secrets.R2_REGION }}
-      NEW_UPDATE_URL: https://ap-launcher-update.nanoda.work/updata/stable.json
-      NEW_PAYLOAD_BASE_URL: https://ap-launcher-update-cdn-cn.nanoda.work/updata
-      NEW_MANIFEST_DEPLOY_ROOT: ${{ secrets.NEW_MANIFEST_DEPLOY_ROOT }}
+      NEW_UPDATE_URL: https://launcher-api.azurpilot.com/updata/stable.json
+      NEW_PAYLOAD_BASE_URL: https://launcher-download.azurpilot.com
+      # CNB Release 固定使用 1.0.0；每次发布覆盖同名附件，JSON 里的 URL
+      # 指向 launcher-download.azurpilot.com，由该域名 302 到 CNB。
+      CNB_API: https://api.cnb.cool
+      CNB_REPO: AzurPilot/AzurPilotLauncher
+      CNB_RELEASE_TAG: "1.0.0"
+      CNB_CLI_VERSION: "1.2.3"
+      # GitCode Release 固定使用 1.0.0；与 CNB 一样按同名资产滚动覆盖。
+      # cnb_url / gitcode_url 写真实直链（不经 launcher-download 302）。
+      GITCODE_API: https://api.gitcode.com/api/v5
+      GITCODE_REPO: ddl2/assets
+      GITCODE_RELEASE_TAG: "1.0.0"
+      # 固定 Wrangler 版本，避免 CI 行为随 latest 漂移。
+      WRANGLER_VERSION: "4.151.1"
     steps:
+      # 日志脱敏：注册 URL 掩码清单（明文见 tools/ci/log-mask.txt；base64 藏在
+      # 环境变量里，避免本步骤自身的日志先出现 URL）。掩码对本 job 之后的全部
+      # 日志生效；修改清单后需重新 base64 并同步两个 workflow 的所有 job。
+      - name: Register log masks
+        shell: bash
+        env:
+          AZURPILOT_LOG_MASK_B64: "IyBDSSDml6Xlv5fmjqnnoIHmuIXljZXvvIjmmI7mlofln7rlh4bvvInjgIIKIyDmr4/kuKogam9iIOmmluatpeaKiuWug+mAkOihjOazqOWGjOS4uiA6OmFkZC1tYXNrOjrvvIxHaXRIdWIg5Lya5oqK5pel5b+X5Lit5ZG95Lit55qE5a2Q5Liy5pu/5o2i5Li6ICoqKuOAggojIOS/ruaUueWQjuaJp+ihjDogYmFzZTY0IC13MCDmnKzmlofku7bvvIjot7Pov4fms6jph4rooYzvvInvvIzmiorovpPlh7rlkIzmraXmm7/mjaIKIyAuZ2l0aHViL3dvcmtmbG93cy9wYWNrYWdlLnltbCDkuI4gdGVzdC55bWwg5Lit5omA5pyJIEFaVVJQSUxPVF9MT0dfTUFTS19CNjQg55qE5YC844CCCiMg5rOo5oSP77ya5pys5paH5Lu25LiN5Lya5Ye6546w5Zyo5pel5b+X6YeM77yI5o6p56CB5q2l6aqk5Y+q6L6T5Ye6IGFkZC1tYXNrIOWRveS7pO+8ie+8jOaUueWKqOivt+S/neaMgeavj+ihjOS4gOS4quWujOaVtOadoeebruOAgeS4jeimgeeVmeepuuihjOOAggpodHRwLmh0dHBzOi8vZ2l0aHViLmNvbS8uZXh0cmFoZWFkZXIKaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvc3RhYmxlLmpzb24KaHR0cHM6Ly9sYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tL3VwZGF0YS9zdGFibGUuanNvbgpodHRwczovL2xhdW5jaGVyLWFwaS5jbi5henVycGlsb3QuY29tCmh0dHBzOi8vbGF1bmNoZXItZG93bmxvYWQuYXp1cnBpbG90LmNvbQpodHRwczovL2FwaS5jbmIuY29vbApodHRwczovL2NuYi5jb29sCmh0dHBzOi8vZ2l0aHViLmNvbS93ZXNzMDkvQXp1clBpbG90TGF1bmNoZXIKaHR0cHM6Ly9naXRodWIuY29tL3dlc3MwOS9BenVyUGlsb3QKaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbQpodHRwczovL3VwbG9hZHMuZ2l0aHViLmNvbQpodHRwczovL29iamVjdHMuZ2l0aHVidXNlcmNvbnRlbnQuY29tCmh0dHBzOi8vZG9jcy5naXRodWIuY29tCmh0dHBzOi8vZ2l0aHViLmNvbS9hc3RyYWwtc2gvc2V0dXAtdXYKaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL2FzdHJhbC1zaC9zZXR1cC11dgpodHRwczovL2dpdGh1Yi5jb20vYXN0cmFsLXNoL3V2Cmh0dHBzOi8vYXN0cmFsLnNoCmh0dHBzOi8vZ2l0aHViLmNvbS9hY3Rpb25zL3B5dGhvbi12ZXJzaW9ucwpodHRwczovL2dpdGh1Yi5jb20vYWN0aW9ucy9zZXR1cC1weXRob24KaHR0cHM6Ly9naXRodWIuY29tL2FjdGlvbnMvbm9kZS12ZXJzaW9ucwpodHRwczovL3N0YXRpYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vc2gucnVzdHVwLnJzCmh0dHBzOi8vY3JhdGVzLmlvCmh0dHBzOi8vaW5kZXguY3JhdGVzLmlvCmh0dHBzOi8vc3RhdGljLmNyYXRlcy5pbwpodHRwczovL2RvYy5ydXN0LWxhbmcub3JnCmh0dHBzOi8vZ2l0aHViLmNvbS9ydXN0LWxhbmcKaHR0cHM6Ly92Mi50YXVyaS5hcHAKaHR0cHM6Ly90YXVyaS5hcHAKaHR0cHM6Ly93d3cuaW5ub3NldHVwLmNvbQpodHRwczovL3JvbGx1cGpzLm9yZwpodHRwczovL3ZpdGUuZGV2Cmh0dHBzOi8vcmVnaXN0cnkubnBtanMub3JnCmh0dHBzOi8vZG9jcy5ucG1qcy5jb20KaHR0cHM6Ly9jbGkuZ2l0aHViLmNvbQpodHRwczovL3B5cGkub3JnCmh0dHBzOi8vZmlsZXMucHl0aG9uaG9zdGVkLm9yZwpodHRwczovL2RsLmdvb2dsZS5jb20KaHR0cHM6Ly9wYWNrYWdlcy5taWNyb3NvZnQuY29tCmh0dHBzOi8vY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9jb21tdW5pdHkuY2hvY29sYXRleS5vcmcKaHR0cHM6Ly9ha2EubXMKaHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvd29ya2Vycy1zZGsKaHR0cHM6Ly9leGFtcGxlLmNvbQpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuYXp1cnBpbG90LmNvbQpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbS91cGRhdGEvKgpsYXVuY2hlci1hcGkuY24uYXp1cnBpbG90LmNvbQpsYXVuY2hlci1kb3dubG9hZC5henVycGlsb3QuY29tCmF6dXJwaWxvdC5jb20KYXBpLmNuYi5jb29sCmNuYi5jb29sCmxhdW5jaGVyLWNsb3VkZmxhcmUtY2RuLWRvd25sb2FkLmF6dXJwaWxvdC5jb20K"
+        run: |
+          printf '%s' "$AZURPILOT_LOG_MASK_B64" | openssl base64 -d -A | while IFS= read -r value; do
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+          done
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Download launcher updater payloads
         uses: actions/download-artifact@v4
         with:
@@ -589,7 +713,12 @@ jobs:
           path: launcher-updater
       - name: Prepare versioned launcher updater payloads
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || needs.package.outputs.canary-version }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'canary' }}
+          # CDN 域绑定 R2 桶根，载荷键为 updata/{version}/{name}（R2_PREFIX）。
+          CLOUDFLARE_CDN_BASE_URL: https://launcher-cloudflare-cdn-download.azurpilot.com
+          CNB_BASE_URL: https://cnb.cool/AzurPilot/AzurPilotLauncher/-/releases/download/1.0.0
+          GITCODE_BASE_URL: https://gitcode.com/ddl2/assets/releases/download/1.0.0
         run: |
           python - <<'PY'
           import hashlib
@@ -602,11 +731,13 @@ jobs:
           version = os.environ["VERSION"].strip()
           if version.startswith("v"):
               version = version[1:]
+          # 正式版发布到 tag Release；金丝雀滚动发布到固定的 canary Release。
+          release_tag = os.environ["RELEASE_TAG"].strip()
 
           manifest_url = os.environ["NEW_UPDATE_URL"].rstrip("/")
           if not manifest_url.endswith("/stable.json"):
               raise SystemExit("LAUNCHER_NEW_UPDATE_URL must end with /stable.json")
-          base_url = f'{os.environ["NEW_PAYLOAD_BASE_URL"].rstrip("/")}/{version}'
+          base_url = os.environ["NEW_PAYLOAD_BASE_URL"].rstrip("/")
           source_root = Path("launcher-updater")
           target_root = Path("launcher-updater-r2")
           if target_root.exists():
@@ -614,7 +745,7 @@ jobs:
           target_root.mkdir(parents=True, exist_ok=True)
 
           files = sorted(
-              p for p in source_root.glob("alas-launcher-*")
+              p for p in source_root.glob("azurpilot-*")
               if p.is_file() and p.name != "stable.json"
           )
           if not files:
@@ -628,7 +759,7 @@ jobs:
           platforms = {}
           for file_path in files:
               name = file_path.name
-              key = name[len("alas-launcher-"):]
+              key = name[len("azurpilot-"):]
               if key.endswith(".exe"):
                   key = key[:-4]
               dest_name = versioned_name(name)
@@ -636,7 +767,14 @@ jobs:
               shutil.copy2(file_path, dest_path)
               digest = hashlib.sha256(dest_path.read_bytes()).hexdigest()
               platforms[key] = {
-                  "url": f"{base_url}/{dest_name}",
+                  # 保持 launcher-download BaseURL，路径带 updata/{version}/ 前缀，
+                  # 与 R2 载荷键及 cloudflare_url 的路径结构一致。
+                  "url": f"{base_url}/{os.environ['R2_PREFIX'].strip('/')}/{version}/{dest_name}",
+                  "github_url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{release_tag}/{dest_name}",
+                  "cloudflare_url": f"{os.environ['CLOUDFLARE_CDN_BASE_URL'].rstrip('/')}/{os.environ['R2_PREFIX'].strip('/')}/{version}/{dest_name}",
+                  # CNB / GitCode 真实直链（不走 launcher-download 302）。
+                  "cnb_url": f"{os.environ['CNB_BASE_URL'].rstrip('/')}/{dest_name}",
+                  "gitcode_url": f"{os.environ['GITCODE_BASE_URL'].rstrip('/')}/{dest_name}",
                   "sha256": digest,
               }
 
@@ -647,18 +785,26 @@ jobs:
               "platforms": platforms,
           }
           (target_root / "stable.json").write_text(
-              json.dumps(manifest, ensure_ascii=False, indent=2),
+              json.dumps(manifest, ensure_ascii=False, separators=(',', ':')),
               encoding="utf-8",
           )
-          print(f"Publishing mTLS manifest to {manifest_url}")
-          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          print(f"Publishing launcher manifest {version} ({len(platforms)} platforms)")
+          for platform_key in sorted(platforms):
+              print(f"  {platform_key}: sha256={platforms[platform_key]['sha256']}")
           PY
+      - name: Upload versioned launcher payloads to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'canary' }}
+        run: gh release upload "$RELEASE_TAG" launcher-updater-r2/azurpilot-* --clobber
       - name: Upload versioned payloads to R2
+        env:
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || needs.package.outputs.canary-version }}
         run: |
           set -eu
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_VERSION#v}"
           root="launcher-updater-r2"
-          for file in "${root}"/alas-launcher-*; do
+          for file in "${root}"/azurpilot-*; do
             [ -f "${file}" ] || continue
             name="$(basename "${file}")"
             aws s3 cp "${file}" "s3://${R2_BUCKET}/${R2_PREFIX}/${version}/${name}" \
@@ -667,33 +813,167 @@ jobs:
               --cache-control "public, max-age=31536000, immutable" \
               --only-show-errors
           done
-      - name: Setup SSH key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
-      - name: Trust deployment host
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -p "${{ secrets.DEPLOY_PORT }}" "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
-      - name: Upload new manifest to OpenResty path
+      # GitHub Actions 只上传 CNB（海外能连，慢）；GitCode 附件预签名地址固定在
+      # 华为云华南节点，海外 runner 直连不通，改由 CNB 国内流水线转传同步。
+      - name: Upload launcher payloads to CNB and trigger GitCode sync
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_PATH: ${{ secrets.NEW_MANIFEST_DEPLOY_ROOT }}/updata
-        run: |
-          set -eu
-          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
-          ssh -p "${DEPLOY_PORT}" "${REMOTE}" "sudo -n mkdir -p '${DEPLOY_PATH}' && sudo -n chown '${DEPLOY_USER}' '${DEPLOY_PATH}'"
-          scp -q -P "${DEPLOY_PORT}" launcher-updater-r2/stable.json "${REMOTE}:${DEPLOY_PATH}/stable.json"
-      - name: Delete superseded R2 payload versions
-        env:
-          VERSION: ${{ github.ref_name }}
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
-          version="${VERSION#v}"
+          files=(launcher-updater-r2/azurpilot-*)
+          if [[ ! -e "${files[0]}" ]]; then
+            echo "::error::launcher-updater-r2 中没有构建产物" >&2
+            exit 1
+          fi
+
+          upload_cnb() {
+            if [[ -z "${CNB_TOKEN:-}" ]]; then
+              echo "::error::缺少 CNB_TOKEN，无法上传构建产物到 CNB" >&2
+              return 1
+            fi
+            local cli="${RUNNER_TEMP}/git-cnb"
+            curl -fsSL \
+              "https://cnb.cool/looc/git-cnb/-/releases/download/${CNB_CLI_VERSION}/git-cnb_linux_amd64" \
+              -o "${cli}"
+            chmod +x "${cli}"
+
+            local auth=(-H "Authorization: token ${CNB_TOKEN}" -H "Accept: application/vnd.cnb.api+json")
+            local release_json release_id
+            release_json="$(curl -fsS "${auth[@]}" "${CNB_API}/${CNB_REPO}/-/releases/tags/${CNB_RELEASE_TAG}")"
+            release_id="$(jq -r '.id // empty' <<<"${release_json}")"
+            if [[ -z "${release_id}" ]]; then
+              echo "::error::CNB Release ${CNB_RELEASE_TAG} 不存在或无法读取" >&2
+              return 1
+            fi
+
+            local pids=() file name asset_id
+            for file in "${files[@]}"; do
+              [[ -f "${file}" ]] || continue
+              name="$(basename "${file}")"
+              asset_id="$(jq -r --arg name "${name}" '.assets[]? | select(.name == $name) | .id' <<<"${release_json}" | head -n1)"
+              if [[ -n "${asset_id}" && "${asset_id}" != "null" ]]; then
+                echo "Deleting existing CNB asset: ${name} (${asset_id})"
+                curl -fsS -X DELETE "${auth[@]}" \
+                  "${CNB_API}/${CNB_REPO}/-/releases/${release_id}/assets/${asset_id}" >/dev/null
+              fi
+              (
+                echo "Uploading to CNB: ${name}"
+                "${cli}" --repo="${CNB_REPO}" release asset-upload \
+                  -t "${CNB_RELEASE_TAG}" -f "${file}"
+              ) &
+              pids+=($!)
+            done
+            for pid in "${pids[@]}"; do
+              wait "${pid}"
+            done
+
+            if [[ "${GITHUB_REF_TYPE:-}" != "tag" ]]; then
+              # 金丝雀发布：官方源 302 到 CNB 同名资产，必须随每次构建更新。
+              # 上传后滚动清理旧金丝雀资产（保留本次与正式版命名的资产），
+              # 避免 CNB Release 上无限堆积历史构建。
+              declare -A keep=()
+              for file in "${files[@]}"; do
+                [[ -f "${file}" ]] && keep["$(basename "${file}")"]=1
+              done
+              jq -r '.assets[]?.name' <<<"${release_json}" | while IFS= read -r asset_name; do
+                [[ "${asset_name}" == *-canary.* ]] || continue
+                [[ -n "${keep[${asset_name}]:-}" ]] && continue
+                asset_id="$(jq -r --arg name "${asset_name}" '.assets[]? | select(.name == $name) | .id' <<<"${release_json}" | head -n1)"
+                if [[ -n "${asset_id}" && "${asset_id}" != "null" ]]; then
+                  echo "Deleting superseded canary CNB asset: ${asset_name} (${asset_id})"
+                  curl -fsS -X DELETE "${auth[@]}" \
+                    "${CNB_API}/${CNB_REPO}/-/releases/${release_id}/assets/${asset_id}" >/dev/null
+                fi
+              done
+            fi
+          }
+
+          # 触发 CNB 国内流水线，把刚上传到 CNB Release 的本次产物同步到 GitCode。
+          # 文件名按换行传给 CNB；GITCODE_TOKEN / CNB_TOKEN 作为触发器环境变量，
+          # 由 GitHub Actions 的 secrets 自动脱敏，不在流水线配置里落明文。
+          sync_gitcode() {
+            if [[ -z "${GITCODE_TOKEN:-}" || -z "${CNB_TOKEN:-}" ]]; then
+              echo "::error::缺少 GITCODE_TOKEN 或 CNB_TOKEN，无法触发 CNB→GitCode 同步" >&2
+              return 1
+            fi
+            npm install -g @cnbcool/cnb-cli >/dev/null
+            local payload_files
+            payload_files="$(printf '%s\n' "${files[@]##*/}")"
+            CNB_TOKEN="${CNB_TOKEN}" cnb build start-build \
+              --repo "${CNB_REPO}" \
+              --event api_trigger_sync_gitcode \
+              --branch main \
+              --env "PAYLOAD_FILES=${payload_files}" \
+              --env "GITCODE_TOKEN=${GITCODE_TOKEN}" \
+              --env "CNB_TOKEN=${CNB_TOKEN}" \
+              --title "sync gitcode ${GITHUB_REF_NAME}"
+          }
+
+          upload_cnb &
+          cnb_pid=$!
+          rc=0
+          wait "${cnb_pid}" || rc=1
+
+          # CNB 上传成功后触发 CNB 国内流水线，把本次产物同步到 GitCode。
+          # GitCode 附件预签名地址固定在华为云华南节点，海外 runner 直连不通；
+          # CNB 流水线在国内执行，下载/上传都是国内链路。
+          if [[ "${rc}" -eq 0 ]]; then
+            sync_gitcode
+          fi
+          exit "${rc}"
+      # stable.json 以静态资源整体发布到 Worker（cf-worker/ 中没有 main 脚本），
+      # 命中资源的请求不执行 Worker，不消耗 Workers 请求配额。
+      - name: Publish stable.json to Cloudflare Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+            echo "::error::缺少 CLOUDFLARE_API_TOKEN 或 CLOUDFLARE_ACCOUNT_ID，无法发布 stable.json" >&2
+            exit 1
+          fi
+          mkdir -p cf-worker/public/updata
+          mode_arg="--launcher"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            mode_arg="--canary"
+          fi
+          python tools/merge_stable_manifest.py "${mode_arg}" launcher-updater-r2/stable.json --output cf-worker/public/updata/stable.json
+          bash cf-worker/deploy.sh --message "stable.json ${GITHUB_REF_NAME}"
+      - name: Verify Worker serves stable.json
+        env:
+          MANIFEST_URL: ${{ env.NEW_UPDATE_URL }}
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || needs.package.outputs.canary-version }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION#v}"
+          manifest_field="version"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            manifest_field="canary"
+          fi
+          ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 AZURPILOT_LAUNCHER_UPDATE"
+          for attempt in $(seq 1 10); do
+            if curl -fsSL -A "${ua}" --max-time 15 "${MANIFEST_URL}" -o /tmp/stable.json \
+              && python3 -c 'import json,sys; d=json.load(open("/tmp/stable.json", encoding="utf-8")); d=(d.get("canary") or {}) if sys.argv[2]=="canary" else d; sys.exit(0 if d.get("version")==sys.argv[1] else 1)' "${version}" "${manifest_field}" 2>/dev/null; then
+              echo "Worker is serving stable.json ${manifest_field} ${version}"
+              exit 0
+            fi
+            echo "stable.json not updated yet (attempt ${attempt}/10), retrying..."
+            sleep 3
+          done
+          echo "::error::Worker did not serve stable.json ${manifest_field} ${version} within 30 seconds" >&2
+          exit 1
+      - name: Delete superseded R2 payload versions
+        env:
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || needs.package.outputs.canary-version }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION#v}"
           r2_prefix="${R2_PREFIX%/}"
           current_prefix="${r2_prefix}/${version}/"
+          is_tag_release="${GITHUB_REF_TYPE:-}"
           version_prefixes="$(
             aws s3api list-objects-v2 \
               --bucket "${R2_BUCKET}" \
@@ -713,6 +993,19 @@ jobs:
               "${r2_prefix}/"*/) ;;
               *) echo "Refusing to delete unexpected R2 prefix: ${version_prefix}" >&2; exit 1 ;;
             esac
+            if [ "${is_tag_release}" = "tag" ]; then
+              # 正式版发布只清理历史正式版目录，绝不触碰金丝雀载荷：
+              # canary 清单滚动指向上一次金丝雀构建，误删会让更新 404。
+              case "$(basename "${version_prefix%/}")" in
+                *-canary.*) continue ;;
+              esac
+            else
+              # 金丝雀发布只清理历史金丝雀目录，绝不触碰正式版本载荷。
+              case "$(basename "${version_prefix%/}")" in
+                *-canary.*) ;;
+                *) continue ;;
+              esac
+            fi
             aws s3 rm "s3://${R2_BUCKET}/${version_prefix}" \
               --recursive \
               --endpoint-url "${R2_ENDPOINT}" \

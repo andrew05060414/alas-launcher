@@ -1,142 +1,116 @@
-// No default console window createion on Windows
+//! AzurPilot 桌面启动器入口与通用辅助功能。
+//! React 页面通过 launcher 状态控制器驱动启动、停止、修复和显式自更新；
+//! windows 保留 WebUI 标题栏与文件保存注入，updater 负责校验和平台替换。
+
+// 在 Windows 上不创建默认控制台窗口
 #![windows_subsystem = "windows"]
 
+/// 开机自启动管理。
 mod autostart;
+/// gui.py 后端子进程的托管（启动、就绪探测、终止等）。
 mod backend;
+/// 后端环境协议的新旧名称与进程归属判断。
+mod backend_env;
+/// Windows 后端 Job：回收工作进程，同时允许模拟器显式脱离。
+#[cfg(windows)]
+mod backend_process;
+mod cancel;
+/// 后端 WebUI v1 本机控制通道：托盘查询实例与启停调度器。
+mod control_api;
+mod format_util;
+mod fs_util;
+/// Rust 自身的 HTTP/3 优先联网与安全回退。
+mod http_client;
+/// 多语言（i18n）初始化与本地化支持。
 mod i18n;
+mod launcher;
+/// 本机启动器 WS：控制、通知、心跳与免密票据。
 mod launcher_control;
+mod launcher_protocol;
+/// 连接错误的 zsui 原生弹窗（Windows；非 Windows 由 React 弹窗负责）。
+mod native_dialog;
+/// 后端前端构建所需的 Node.js 检测与便携运行时自动下载。
 mod nodejs;
+/// 平台原生通知与点击回调。
 mod notify;
+/// “阻止计算机自动睡眠”设置对应的三平台电源锁。
+mod power;
+/// 统一的启动进度状态、快照与推送节奏。
+mod progress;
+/// 启动器行为设置：SQLite 存储、Tauri 命令与开机自启副作用。
+mod settings;
+mod sources;
+mod task_process;
+/// Windows 托盘右键自绘弹窗菜单（原生 HMENU 不可定制样式）。
+mod tray_menu;
+mod updater;
+mod windows;
+use windows::*;
+mod components;
+/// 后端崩溃报告：退出码人话映射与日志详情提取。
+mod crash_report;
+/// 首次部署、组件更新与后端配置。
 mod setup;
+/// 窗口工具（控制台附着状态等平台辅助）。
 mod window_util;
 
 #[macro_use]
 extern crate rust_i18n;
 i18n!("locales", fallback = "en");
 
-use std::{
-    cell::Cell,
-    collections::HashMap,
-    fs,
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
-    path::{Path, PathBuf},
-    process::Command,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
-    },
-    thread::{self},
-    time::{Duration, Instant},
-};
-
-use crate::{
-    backend::{is_backend_startup_timeout, ManagedBackend, WebuiLaunchConfig},
-    launcher_control::start_launcher_control_stream,
-    notify::{start_notify_stream, NotificationClickHandler},
-    setup::{
-        get_deploy_config, rebuild_venv_and_sync_dependencies, reset_venv_for_rebuild,
-        setup_alas_repo, setup_environment, SplashUpdate,
-    },
-};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::{prelude::BASE64_STANDARD, Engine};
 use chrono::{DateTime, FixedOffset, Local, Utc};
-use reqwest::{
-    blocking::Client,
-    header::{
-        HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_RANGE, DATE, RANGE, USER_AGENT,
-    },
-    StatusCode,
-};
+use reqwest::header::DATE;
 use rust_i18n::t;
-use serde::Deserialize;
-use serde_json::to_string;
-use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+#[cfg(any(windows, target_os = "macos"))]
+use tauri::image::Image;
 use tauri::{
-    image::Image,
-    menu::{MenuBuilder, MenuItemBuilder},
-    tray::TrayIconBuilder,
     webview::{PageLoadEvent, PageLoadPayload},
-    Manager, State, Url, WebviewWindow,
+    Emitter, Manager, State, Url, WebviewWindow,
 };
 use tauri_plugin_dialog::{DialogExt, FilePath};
-#[cfg(windows)]
-use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
-use tempfile::Builder as TempDirBuilder;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
+/// macOS 托盘图标（2x 分辨率 PNG）：Retina 屏幕菜单栏使用的高清版本。
 #[cfg(target_os = "macos")]
 const MENUBAR_ICON_2X: &[u8] = include_bytes!("../icons/menubar@2x.png");
+/// macOS 托盘图标（1x 分辨率 PNG）：2x 图标解码失败时的降级备选。
 #[cfg(target_os = "macos")]
 const MENUBAR_ICON_1X: &[u8] = include_bytes!("../icons/menubar.png");
+/// Windows 系统托盘图标（PNG）。使用内嵌字节而非文件路径，保证打包后
+/// 即使资源缺失托盘图标也能正常加载。
 #[cfg(windows)]
 const WINDOWS_TRAY_ICON: &[u8] = include_bytes!("../icons/icon.png");
-const SPLASH_BG_VIDEO: &[u8] = include_bytes!("../bg/bg.mp4");
-const MI_SANS_FONT: &[u8] = include_bytes!("../fonts/MiSansLauncher.ttf");
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const BACKEND_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(any(windows, target_os = "android"))]
-const BACKEND_ERROR_URL_BASE: &str = "http://alas-error.localhost/backend";
-#[cfg(not(any(windows, target_os = "android")))]
-const BACKEND_ERROR_URL_BASE: &str = "alas-error://localhost/backend";
-#[cfg(any(windows, target_os = "android"))]
-const SPLASH_URL: &str = "http://alas-splash.localhost/";
-#[cfg(not(any(windows, target_os = "android")))]
-const SPLASH_URL: &str = "alas-splash://localhost/";
+/// 所有 WebView 窗口统一使用的 User-Agent（伪装为 Electron 40）。
+/// 由 build.rs 从 tauri.conf.json 的 UA 模板注入版本后写入，单一来源。
+const WEBVIEW_USER_AGENT: &str = env!("AZURPILOT_WEBVIEW_UA");
 const TIME_BOMB_CONFIG_SOURCE: &str = include_str!("../Cargo.toml");
-#[cfg(test)]
-const TAURI_CONFIG_SOURCE: &str = include_str!("../tauri.conf.json");
-const LAUNCHER_UPDATE_URL: &str = env!("LAUNCHER_UPDATE_URL");
-const LAUNCHER_UPDATE_FALLBACK_URL: &str =
-    "https://ap.launcher-update.nanoda.work/updata/stable.json";
-const LAUNCHER_UPDATE_SKIP_ENV: &str = "AZURPILOT_SKIP_LAUNCHER_UPDATE";
-const MINI_LAUNCHER_VERSION: &str = "0.0.1";
-const LAUNCHER_UPDATE_MTLS_IDENTITY: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/launcher_mtls_identity.pem"));
-const LAUNCHER_UPDATE_BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 AZURPILOT_LAUNCHER_UPDATE/2.0.4";
-const LAUNCHER_UPDATE_MAX_CONNECTIONS: usize = 8;
-const LAUNCHER_UPDATE_MIN_CHUNK_BYTES: u64 = 1024 * 1024;
-const LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START: u8 = 8;
-const LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END: u8 = 88;
-#[cfg(windows)]
-const LAUNCHER_UPDATE_NO_CONSOLE_ENV: &str = "AZURPILOT_NO_ATTACH_CONSOLE";
-#[cfg(windows)]
-const LAUNCHER_UPDATE_APPLY_ARG: &str = "--apply-launcher-update";
-const PREVIEW_NO_UPDATE_ARGS: &[&str] = &[
-    "--preview-no-update",
-    "--skip-update",
-    "--no-update",
-    "--disable-update",
-    "/preview-no-update",
-    "/skip-update",
-    "/no-update",
-];
-const PREVIEW_CRASH_ARGS: &[&str] = &[
-    "--preview-crash",
-    "--preview-error",
-    "--crash-preview",
-    "--error-preview",
-    "/preview-crash",
-    "/preview-error",
-];
+/// 请求"启动后最小化到托盘"的命令行参数。
 const START_MINIMIZED_ARGS: &[&str] = &["--start-minimized", "/start-minimized"];
 
 // ---------------------------------------------------------------------------
 // 启动器信任免密登录
 //
-// 启动器为每次会话生成一个随机信任密钥，经环境变量 TRUST_SECRET_ENV 注入到
+// 启动器为每次会话生成一个随机信任密钥，经 backend_env 的双名称环境变量注入到
 // gui.py 子进程。WebUI 启动后会据当前 --key / deploy.yaml Password 登记该
-// 密钥；启动器窗口导航前先向后端换发一次性令牌，再进入 /launcher-login 页面
-// 预置登录态实现免密。信任密钥与会话密钥解耦，其它浏览器仍走原密码门禁。
+// 密钥；窗口导航前通过 WS 换发一次性票据，再由后端认证浏览器会话。
+// 票据不包含 WebUI 密码，其他浏览器仍走原密码门禁。
 // 手动 gui.py 启动时密钥未注入，WebUI 端整体关闭该通道。
 // ---------------------------------------------------------------------------
-pub(crate) const TRUST_SECRET_ENV: &str = "ALAS_WEBUI_TRUST_SECRET";
+/// 信任密钥的原始随机字节数（base64 编码后约 32 字符）。
 const TRUST_SECRET_LENGTH: usize = 24;
-const TRUST_LOGIN_TIMEOUT: Duration = Duration::from_secs(3);
-
+/// 本次会话的信任密钥缓存：首次调用时生成并全程复用，进程结束即失效。
 static LAUNCHER_TRUST_SECRET: OnceLock<String> = OnceLock::new();
 
 /// 生成（首次）并返回本次会话的启动器信任密钥。
@@ -149,48 +123,19 @@ pub(crate) fn launcher_trust_secret() -> &'static str {
     })
 }
 
-/// 计算主窗口应导航到的后端地址：若后端支持启动器免密（本机回环 + 密钥匹配），
-/// 则返回带一次性令牌的 /launcher-login 页面；否则回退普通后端首页，维持原有
-/// 登录行为。本函数不抛错，任何失败都静默回退。
-fn webui_navigate_url(port: u16) -> String {
-    let fallback = || backend_url(port);
-    let secret = launcher_trust_secret();
-    let client = match Client::builder()
-        .timeout(TRUST_LOGIN_TIMEOUT)
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return fallback(),
-    };
-    let response = client
-        .post(format!("http://127.0.0.1:{port}/api/launcher/trusted-login"))
-        .header("X-Webui-Launcher-Secret", secret)
-        .send();
-    let response = match response {
-        Ok(response) if response.status().is_success() => response,
-        _ => return fallback(),
-    };
-    // reqwest 未启用 json feature，手动解析 body。
-    let body_text = match response.text() {
-        Ok(body_text) => body_text,
-        Err(_) => return fallback(),
-    };
-    let body: serde_json::Value = match serde_json::from_str(&body_text) {
-        Ok(body) => body,
-        Err(_) => return fallback(),
-    };
-    let Some(token) = body.get("token").and_then(|token| token.as_str()) else {
-        return fallback();
-    };
-    if token.is_empty() {
-        return fallback();
+/// 通过本次后端会话的 WS 换取一次性票据，失败时进入正常首页。
+fn webui_navigate_url(
+    port: u16,
+    channel: Option<Arc<launcher_control::LauncherChannel>>,
+) -> String {
+    match channel.and_then(|channel| channel.login_ticket().ok()) {
+        Some(ticket) => format!("http://127.0.0.1:{port}/?launcherTicket={ticket}"),
+        None => backend_url(port),
     }
-    // 令牌为 URL-safe 随机串（secrets.token_urlsafe），可直接置于 query。
-    format!("http://127.0.0.1:{port}/launcher-login?token={token}")
 }
 
 /// URL 的日志安全形式：只保留 scheme/host/port/path，剔除 query，避免
-/// /launcher-login 的一次性令牌经日志落盘。
+/// 启动器的一次性登录票据经日志落盘。
 fn redacted_url_log(url: &Url) -> String {
     let Some(host) = url.host_str() else {
         return url.to_string();
@@ -204,31 +149,18 @@ fn redacted_url_log(url: &Url) -> String {
     out
 }
 
-struct ExitControl(Arc<AtomicBool>);
-
+/// 时间炸弹配置：到期时间、网络时间来源 URL 与过期提示文案。
+///
+/// 由 Cargo.toml 的 package.metadata.azurpilot.time-bomb 段解析而来；
+/// 未启用时间炸弹时整体缺省（None）。
 #[derive(Clone, Debug)]
 struct TimeBombConfig {
+    /// 到期时间：RFC 3339 解析为带固定时区的时间，网络时间不早于该值即过期。
     expires_at: DateTime<FixedOffset>,
+    /// 用于获取"可信当前时间"的 URL，取其 HTTP Date 响应头判断。
     network_time_url: String,
+    /// 过期后弹窗展示的提示文案。
     message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LauncherUpdateManifest {
-    version: String,
-    platforms: HashMap<String, LauncherUpdatePlatform>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LauncherUpdatePlatform {
-    url: String,
-    sha256: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LauncherUpdateByteRange {
-    start: u64,
-    end: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -250,6 +182,10 @@ fn tray_icon_for_platform() -> Image<'static> {
     result
 }
 
+/// 加载 Windows 托盘图标（从内嵌 PNG 字节解码）。
+///
+/// # Panics
+/// 图标字节解码失败时 panic——没有图标时托盘无法创建。
 #[cfg(windows)]
 fn tray_icon_for_platform() -> Image<'static> {
     Image::from_bytes(WINDOWS_TRAY_ICON).unwrap_or_else(|err| {
@@ -258,80 +194,11 @@ fn tray_icon_for_platform() -> Image<'static> {
     })
 }
 
-fn begin_startup_cleanup(
-    app_handle: tauri::AppHandle,
-    allow_exit: Arc<AtomicBool>,
-    setup_cancel_requested: Arc<AtomicBool>,
-    setup_running: Arc<AtomicBool>,
-    startup_cleanup_started: Arc<AtomicBool>,
-) {
-    if startup_cleanup_started
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-
-    setup_cancel_requested.store(true, Ordering::SeqCst);
-    if let Some(splash) = app_handle.get_webview_window("splash") {
-        update_splash(
-            &splash,
-            &SplashUpdate::loading(
-                t!("dialog.cleaning_env"),
-                t!("dialog.cleaning_env_detail"),
-                99,
-            )
-            .with_subtitle(t!("dialog.cleaning_wait")),
-        );
-    }
-
-    app_handle
-        .dialog()
-        .message(t!("dialog.cleaning_message"))
-        .title(t!("dialog.cleaning_env"))
-        .show(|_| {});
-
-    thread::spawn(move || {
-        let started_at = Instant::now();
-        while setup_running.load(Ordering::SeqCst) && started_at.elapsed() < Duration::from_secs(30)
-        {
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        if setup_running.load(Ordering::SeqCst) {
-            warn!("Setup thread did not stop before startup cleanup timeout");
-        }
-
-        match reset_venv_for_rebuild() {
-            Ok(()) => {
-                info!("Startup cleanup finished; runtime will be rebuilt on next launch");
-            }
-            Err(e) => {
-                error!("Startup cleanup failed: {:?}", e);
-                if let Some(splash) = app_handle.get_webview_window("splash") {
-                    update_splash(
-                        &splash,
-                        &SplashUpdate::error(
-                            t!("dialog.cleanup_failed"),
-                            t!("dialog.cleanup_failed_detail", error = format!("{e:#}")),
-                            99,
-                        ),
-                    );
-                }
-                startup_cleanup_started.store(false, Ordering::SeqCst);
-                return;
-            }
-        }
-
-        allow_exit.store(true, Ordering::SeqCst);
-        app_handle.exit(0);
-    });
-}
-
 fn time_bomb_config() -> Result<Option<TimeBombConfig>> {
-    let Some(section) = cargo_toml_section("package.metadata.alas-launcher.time-bomb") else {
+    let Some(section) = cargo_toml_section("package.metadata.azurpilot.time-bomb") else {
         return Ok(None);
     };
+    // enabled 字段缺省按 false 处理：解析不到就当作未启用时间炸弹。
     let enabled = cargo_toml_value(section, "enabled")
         .and_then(|value| value.parse::<bool>().ok())
         .unwrap_or(false);
@@ -343,8 +210,9 @@ fn time_bomb_config() -> Result<Option<TimeBombConfig>> {
         .ok_or_else(|| anyhow!(t!("errors.time_bomb_not_configured")))?;
     let expires_at = DateTime::parse_from_rfc3339(&expires_at)
         .map_err(|err| anyhow!(t!("errors.time_bomb_format_error", error = err.to_string())))?;
+    // network-time-url 与 message 均有内置默认值，缺省也能工作。
     let network_time_url = cargo_toml_value(section, "network-time-url")
-        .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_owned());
+        .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_owned());
     let message = cargo_toml_value(section, "message")
         .unwrap_or_else(|| t!("errors.time_bomb_expired").to_string());
 
@@ -355,6 +223,10 @@ fn time_bomb_config() -> Result<Option<TimeBombConfig>> {
     }))
 }
 
+/// 在内嵌 Cargo.toml 文本中定位 `[section_name]` 段，返回段体文本
+/// （到下一个段头或文件末尾为止）。找不到段时返回 None。
+///
+/// 采用手写查找而非完整 TOML 库：仅需读取一个已知段，避免额外依赖。
 fn cargo_toml_section(section_name: &str) -> Option<&'static str> {
     let header = format!("[{section_name}]");
     let start = TIME_BOMB_CONFIG_SOURCE.find(&header)? + header.len();
@@ -363,6 +235,9 @@ fn cargo_toml_section(section_name: &str) -> Option<&'static str> {
     Some(&rest[..end])
 }
 
+/// 在 TOML 段文本中按行查找 `key = value`，返回去掉两侧引号后的字符串值。
+///
+/// 只处理单行简单键值：`#` 之后视为注释；找不到 key 时返回 None。
 fn cargo_toml_value(section: &str, key: &str) -> Option<String> {
     for line in section.lines() {
         let line = line
@@ -388,6 +263,13 @@ fn cargo_toml_value(section: &str, key: &str) -> Option<String> {
     None
 }
 
+/// 判断时间炸弹是否已过期。
+///
+/// # Returns
+/// 已过期返回 Some(配置的提示文案)；未配置或未过期返回 Ok(None)。
+///
+/// # Errors
+/// 配置解析或网络时间获取失败时返回 Err（调用方会告警并放行启动）。
 fn time_bomb_expiration_message() -> Result<Option<String>> {
     let Some(config) = time_bomb_config()? else {
         return Ok(None);
@@ -400,12 +282,21 @@ fn time_bomb_expiration_message() -> Result<Option<String>> {
     }
 }
 
+/// 从指定 URL 的 HTTP Date 响应头获取"可信"网络时间。
+///
+/// 直接读取响应头而非解析响应体，可复用任意轻量端点（如 gstatic 的
+/// generate_204），无需依赖专门的授时服务。
+///
+/// # Errors
+/// 请求失败、响应缺少 Date 头或 Date 头不是合法 RFC 2822 时间时返回 Err。
 fn fetch_network_time(url: &str) -> Result<DateTime<Utc>> {
-    let client = reqwest::blocking::Client::builder()
+    // 5 秒超时并禁用系统代理：取的是响应头时间，必须直连目标服务器，
+    // 避免代理故障拖慢启动或干扰结果。
+    let client = http_client::Client::builder()
         .timeout(Duration::from_secs(5))
         .no_proxy()
         .build()?;
-    let response = client.get(url).send()?;
+    let response = client.get(url).send()?.error_for_status()?;
     let date_header = response
         .headers()
         .get(DATE)
@@ -414,846 +305,8 @@ fn fetch_network_time(url: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc2822(date_header)?.with_timezone(&Utc))
 }
 
-fn launcher_update_browser_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static(LAUNCHER_UPDATE_BROWSER_UA),
-    );
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/octet-stream,application/json,text/plain,*/*;q=0.8"),
-    );
-    headers.insert(
-        ACCEPT_LANGUAGE,
-        HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
-    );
-    headers
-}
-
-fn launcher_update_http_client(
-    timeout: Option<Duration>,
-    with_mtls_identity: bool,
-) -> Result<Client> {
-    let mut builder = Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .no_proxy()
-        .default_headers(launcher_update_browser_headers());
-    if with_mtls_identity && !LAUNCHER_UPDATE_MTLS_IDENTITY.is_empty() {
-        builder = builder.identity(reqwest::Identity::from_pem(LAUNCHER_UPDATE_MTLS_IDENTITY)?);
-    }
-    builder = match timeout {
-        Some(timeout) => builder.timeout(timeout),
-        None => builder.timeout(None),
-    };
-    Ok(builder.build()?)
-}
-
-fn fetch_launcher_update_manifest(client: &Client) -> Result<LauncherUpdateManifest> {
-    fetch_launcher_update_manifest_from_urls(
-        client,
-        &[LAUNCHER_UPDATE_URL, LAUNCHER_UPDATE_FALLBACK_URL],
-    )
-}
-
-fn fetch_launcher_update_manifest_from_urls(
-    client: &Client,
-    urls: &[&str],
-) -> Result<LauncherUpdateManifest> {
-    let mut failures = Vec::new();
-
-    for (index, url) in urls.iter().enumerate() {
-        if urls[..index].iter().any(|previous| previous == url) {
-            continue;
-        }
-
-        match fetch_launcher_update_manifest_from_url(client, url) {
-            Ok(manifest) => {
-                if index > 0 {
-                    info!("Using fallback launcher update manifest: {url}");
-                }
-                return Ok(manifest);
-            }
-            Err(error) => {
-                warn!("Unable to fetch launcher update manifest from {url}: {error:#}");
-                failures.push(format!("{url}: {error:#}"));
-            }
-        }
-    }
-
-    bail!(
-        "Unable to fetch launcher update manifest from all configured URLs: {}",
-        failures.join("; ")
-    )
-}
-
-fn fetch_launcher_update_manifest_from_url(
-    client: &Client,
-    url: &str,
-) -> Result<LauncherUpdateManifest> {
-    let manifest_text = client
-        .get(url)
-        .send()
-        .with_context(|| format!("request launcher update manifest from {url}"))?
-        .error_for_status()
-        .with_context(|| format!("validate launcher update manifest response from {url}"))?
-        .text()
-        .with_context(|| format!("read launcher update manifest from {url}"))?;
-    serde_json::from_str(&manifest_text)
-        .with_context(|| format!("parse launcher update manifest from {url}"))
-}
-
-fn launcher_version_is_mini(version: &str) -> bool {
-    version.strip_prefix('v').unwrap_or(version) == MINI_LAUNCHER_VERSION
-}
-
-fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate)) -> Result<bool> {
-    if std::env::var_os(LAUNCHER_UPDATE_SKIP_ENV).is_some() {
-        info!("Skipping launcher update check after restart");
-        std::env::remove_var(LAUNCHER_UPDATE_SKIP_ENV);
-        return Ok(false);
-    }
-
-    let current_version = env!("CARGO_PKG_VERSION");
-    let mini_launcher = launcher_version_is_mini(current_version);
-    let platform_key = launcher_update_platform_key();
-    let manifest_client = match launcher_update_http_client(Some(Duration::from_secs(10)), false) {
-        Ok(client) => client,
-        Err(err) => {
-            warn!("Unable to create launcher update client: {err:#}");
-            return Err(anyhow!(t!(
-                "launcher_update.check_failed",
-                error = format!("{err:#}")
-            )));
-        }
-    };
-    let manifest = match fetch_launcher_update_manifest(&manifest_client) {
-        Ok(manifest) => manifest,
-        Err(err) => {
-            return Err(anyhow!(t!(
-                "launcher_update.check_failed",
-                error = format!("{err:#}")
-            )));
-        }
-    };
-    let update_available = launcher_version_is_newer(current_version, &manifest.version)
-        .ok_or_else(|| {
-            warn!(
-                "Launcher update manifest contains an invalid version: {}",
-                manifest.version
-            );
-            anyhow!(t!(
-                "launcher_update.invalid_manifest_version",
-                version = manifest.version.clone()
-            ))
-        })?;
-    if !update_available {
-        info!(
-            "Launcher is up to date: current={}, latest={}",
-            current_version, manifest.version
-        );
-        if mini_launcher {
-            return Err(anyhow!(t!(
-                "launcher_update.mini_update_missing",
-                current = current_version,
-                latest = manifest.version
-            )));
-        }
-        return Ok(false);
-    }
-
-    let Some(platform) = manifest.platforms.get(platform_key) else {
-        warn!("No launcher update payload for platform {platform_key}");
-        return Err(anyhow!(t!(
-            "launcher_update.payload_missing",
-            platform = platform_key
-        )));
-    };
-
-    info!(
-        "Launcher update available: {} -> {}",
-        current_version, manifest.version
-    );
-    status_updater(
-        SplashUpdate::loading(
-            t!("launcher_update.updating"),
-            t!(
-                "launcher_update.available_detail",
-                version = manifest.version.clone()
-            ),
-            8,
-        )
-        .with_subtitle(t!("launcher_update.status")),
-    );
-
-    let current_exe = std::env::current_exe()?;
-    let update_path = launcher_update_temp_path(&current_exe);
-    if let Err(err) = download_launcher_update(
-        &platform.url,
-        &update_path,
-        &platform.sha256,
-        &mut status_updater,
-    ) {
-        warn!("Launcher update download failed: {err:#}");
-        return Err(err);
-    }
-    make_executable(&update_path)?;
-    status_updater(
-        SplashUpdate::loading(
-            t!("launcher_update.restart_title"),
-            t!("launcher_update.restarting_detail"),
-            100,
-        )
-        .with_subtitle(t!("launcher_update.restart_status")),
-    );
-    if let Err(err) = replace_launcher_and_restart(&current_exe, &update_path) {
-        warn!("Launcher update replacement failed: {err:#}");
-        return Err(err);
-    }
-    Ok(true)
-}
-
-fn download_launcher_update(
-    url: &str,
-    update_path: &Path,
-    expected_sha256: &str,
-    mut status_updater: impl FnMut(SplashUpdate),
-) -> Result<()> {
-    validate_launcher_update_payload(url, expected_sha256)?;
-
-    // The public manifest supplies the payload URL; ESA requires mTLS for the payload itself.
-    let client = launcher_update_http_client(None, true)?;
-    let part_path = launcher_update_part_path(update_path);
-    remove_launcher_update_file_if_exists(&part_path)?;
-    remove_launcher_update_file_if_exists(update_path)?;
-
-    info!("Downloading launcher update from {url}");
-    let range_total = launcher_update_range_total(&client, url)?;
-    let download_result = match range_total {
-        Some(total_bytes) => {
-            let ranges = launcher_update_byte_ranges(total_bytes);
-            if ranges.len() > 1 {
-                status_updater(
-                    SplashUpdate::loading(
-                        t!("launcher_update.updating"),
-                        t!(
-                            "launcher_update.parallel_downloading_detail",
-                            connections = ranges.len().to_string()
-                        ),
-                        LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START,
-                    )
-                    .with_subtitle(t!("launcher_update.status")),
-                );
-                download_launcher_update_parallel(
-                    &client,
-                    url,
-                    total_bytes,
-                    &ranges,
-                    &part_path,
-                    &mut status_updater,
-                )
-            } else {
-                info!("Launcher update payload is too small for parallel download");
-                download_launcher_update_sequential(
-                    &client,
-                    url,
-                    &part_path,
-                    Some(total_bytes),
-                    &mut status_updater,
-                )
-            }
-        }
-        None => {
-            info!("Launcher update server does not support HTTP byte ranges; using one connection");
-            download_launcher_update_sequential(&client, url, &part_path, None, &mut status_updater)
-        }
-    };
-    let _downloaded = match download_result {
-        Ok(downloaded) => downloaded,
-        Err(err) => {
-            cleanup_launcher_update_download_files(&part_path, update_path);
-            return Err(err);
-        }
-    };
-
-    status_updater(
-        SplashUpdate::loading(
-            t!("launcher_update.updating"),
-            t!("launcher_update.verifying_detail"),
-            92,
-        )
-        .with_subtitle(t!("launcher_update.status")),
-    );
-
-    let downloaded =
-        match verify_and_promote_launcher_update(&part_path, update_path, expected_sha256) {
-            Ok(downloaded) => downloaded,
-            Err(err) => {
-                cleanup_launcher_update_download_files(&part_path, update_path);
-                return Err(err);
-            }
-        };
-
-    info!(
-        "Launcher update downloaded: {} bytes -> {}",
-        downloaded,
-        update_path.display()
-    );
-    Ok(())
-}
-
-fn validate_launcher_update_payload(url: &str, expected_sha256: &str) -> Result<()> {
-    let parsed_url =
-        Url::parse(url).with_context(|| format!("invalid launcher update URL: {url}"))?;
-    if parsed_url.scheme() != "https" || parsed_url.host_str().is_none() {
-        bail!("launcher update URL must use HTTPS and include a host: {url}");
-    }
-    if !launcher_update_sha256_is_valid(expected_sha256) {
-        bail!("launcher update manifest contains an invalid SHA-256 digest");
-    }
-    Ok(())
-}
-
-fn launcher_update_sha256_is_valid(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn launcher_update_range_total(client: &Client, url: &str) -> Result<Option<u64>> {
-    let response = client
-        .get(url)
-        .header(RANGE, "bytes=0-0")
-        .send()?
-        .error_for_status()?;
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        return Ok(None);
-    }
-
-    let Some((start, end, total)) = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_launcher_update_content_range)
-    else {
-        return Ok(None);
-    };
-    if start != 0 || end != 0 || total == 0 {
-        return Ok(None);
-    }
-    Ok(Some(total))
-}
-
-fn parse_launcher_update_content_range(value: &str) -> Option<(u64, u64, u64)> {
-    let value = value.trim().strip_prefix("bytes ")?;
-    let (range, total) = value.split_once('/')?;
-    let (start, end) = range.split_once('-')?;
-    let start = start.parse().ok()?;
-    let end = end.parse().ok()?;
-    let total = total.parse().ok()?;
-    (start <= end && end < total).then_some((start, end, total))
-}
-
-fn launcher_update_byte_ranges(total_bytes: u64) -> Vec<LauncherUpdateByteRange> {
-    if total_bytes == 0 {
-        return Vec::new();
-    }
-
-    let range_count = total_bytes
-        .saturating_add(LAUNCHER_UPDATE_MIN_CHUNK_BYTES - 1)
-        .checked_div(LAUNCHER_UPDATE_MIN_CHUNK_BYTES)
-        .unwrap_or(1)
-        .clamp(1, LAUNCHER_UPDATE_MAX_CONNECTIONS as u64) as usize;
-    let base_size = total_bytes / range_count as u64;
-    let extra_bytes = total_bytes % range_count as u64;
-    let mut start = 0;
-    let mut ranges = Vec::with_capacity(range_count);
-
-    for index in 0..range_count {
-        let size = base_size + u64::from(index < extra_bytes as usize);
-        let end = start + size - 1;
-        ranges.push(LauncherUpdateByteRange { start, end });
-        start = end + 1;
-    }
-    ranges
-}
-
-fn download_launcher_update_parallel(
-    client: &Client,
-    url: &str,
-    total_bytes: u64,
-    ranges: &[LauncherUpdateByteRange],
-    part_path: &Path,
-    status_updater: &mut impl FnMut(SplashUpdate),
-) -> Result<u64> {
-    let temp_dir = TempDirBuilder::new()
-        .prefix("azurpilot-launcher-update-")
-        .tempdir()
-        .context("create temporary launcher update download directory")?;
-    let (progress_sender, progress_receiver) = mpsc::channel();
-    let mut workers = Vec::with_capacity(ranges.len());
-    let mut chunk_paths = Vec::with_capacity(ranges.len());
-
-    for (index, range) in ranges.iter().copied().enumerate() {
-        let chunk_path = temp_dir.path().join(format!("chunk-{index:02}"));
-        let worker_client = client.clone();
-        let worker_url = url.to_owned();
-        let worker_path = chunk_path.clone();
-        let worker_sender = progress_sender.clone();
-        workers.push(thread::spawn(move || {
-            download_launcher_update_range(
-                &worker_client,
-                &worker_url,
-                range,
-                &worker_path,
-                &worker_sender,
-            )
-        }));
-        chunk_paths.push(chunk_path);
-    }
-    drop(progress_sender);
-
-    let started_at = Instant::now();
-    let mut downloaded_so_far = 0u64;
-    let mut last_reported_progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
-    let mut last_reported_at = Instant::now() - Duration::from_secs(1);
-    while workers.iter().any(|worker| !worker.is_finished()) {
-        match progress_receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(downloaded) => {
-                downloaded_so_far = downloaded_so_far.saturating_add(downloaded);
-                report_launcher_update_download_progress(
-                    status_updater,
-                    downloaded_so_far,
-                    total_bytes,
-                    started_at,
-                    &mut last_reported_progress,
-                    &mut last_reported_at,
-                );
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    while let Ok(downloaded) = progress_receiver.try_recv() {
-        downloaded_so_far = downloaded_so_far.saturating_add(downloaded);
-    }
-
-    let mut completed_bytes = 0u64;
-    for worker in workers {
-        completed_bytes = completed_bytes.saturating_add(
-            worker
-                .join()
-                .map_err(|_| anyhow!("launcher update download worker panicked"))??,
-        );
-    }
-    if completed_bytes != total_bytes {
-        bail!(
-            "launcher update download incomplete: expected {} bytes, got {} bytes",
-            total_bytes,
-            completed_bytes
-        );
-    }
-
-    report_launcher_update_download_progress(
-        status_updater,
-        total_bytes,
-        total_bytes,
-        started_at,
-        &mut last_reported_progress,
-        &mut last_reported_at,
-    );
-    let merged_bytes = merge_launcher_update_chunks(&chunk_paths, part_path)?;
-    if merged_bytes != total_bytes {
-        bail!(
-            "launcher update merge incomplete: expected {} bytes, got {} bytes",
-            total_bytes,
-            merged_bytes
-        );
-    }
-    Ok(merged_bytes)
-}
-
-fn download_launcher_update_range(
-    client: &Client,
-    url: &str,
-    range: LauncherUpdateByteRange,
-    chunk_path: &Path,
-    progress_sender: &mpsc::Sender<u64>,
-) -> Result<u64> {
-    let requested_range = format!("bytes={}-{}", range.start, range.end);
-    let mut response = client
-        .get(url)
-        .header(RANGE, requested_range)
-        .send()?
-        .error_for_status()?;
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        bail!(
-            "launcher update server ignored byte range {}-{}",
-            range.start,
-            range.end
-        );
-    }
-
-    let Some((start, end, _)) = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_launcher_update_content_range)
-    else {
-        bail!("launcher update range response is missing a valid Content-Range header");
-    };
-    if start != range.start || end != range.end {
-        bail!(
-            "launcher update range response does not match requested bytes {}-{}",
-            range.start,
-            range.end
-        );
-    }
-
-    let expected_bytes = range.end - range.start + 1;
-    if response
-        .content_length()
-        .is_some_and(|content_length| content_length != expected_bytes)
-    {
-        bail!(
-            "launcher update range response has wrong length for bytes {}-{}",
-            range.start,
-            range.end
-        );
-    }
-
-    let mut file = fs::File::create(chunk_path)?;
-    let mut downloaded = 0u64;
-    let mut buffer = [0u8; 128 * 1024];
-    loop {
-        let size = response.read(&mut buffer)?;
-        if size == 0 {
-            break;
-        }
-        file.write_all(&buffer[..size])?;
-        downloaded += size as u64;
-        let _ = progress_sender.send(size as u64);
-    }
-    file.flush()?;
-
-    if downloaded != expected_bytes {
-        bail!(
-            "launcher update range download incomplete for bytes {}-{}: expected {} bytes, got {} bytes",
-            range.start,
-            range.end,
-            expected_bytes,
-            downloaded
-        );
-    }
-    Ok(downloaded)
-}
-
-fn merge_launcher_update_chunks(chunk_paths: &[PathBuf], part_path: &Path) -> Result<u64> {
-    let mut output = fs::File::create(part_path).with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = part_path.display().to_string()
-        )
-    })?;
-    let mut written = 0u64;
-    for chunk_path in chunk_paths {
-        let mut chunk = fs::File::open(chunk_path)?;
-        written = written.saturating_add(std::io::copy(&mut chunk, &mut output)?);
-    }
-    output.flush().with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = part_path.display().to_string()
-        )
-    })?;
-    Ok(written)
-}
-
-fn report_launcher_update_download_progress(
-    status_updater: &mut impl FnMut(SplashUpdate),
-    downloaded: u64,
-    total_bytes: u64,
-    started_at: Instant,
-    last_reported_progress: &mut u8,
-    last_reported_at: &mut Instant,
-) {
-    let (progress, detail) =
-        launcher_download_progress_detail(downloaded, Some(total_bytes), started_at);
-    if progress > *last_reported_progress
-        || last_reported_at.elapsed() >= Duration::from_millis(250)
-    {
-        *last_reported_progress = progress;
-        *last_reported_at = Instant::now();
-        status_updater(
-            SplashUpdate::loading(t!("launcher_update.updating"), detail, progress)
-                .with_subtitle(t!("launcher_update.status")),
-        );
-    }
-}
-
-fn verify_and_promote_launcher_update(
-    part_path: &Path,
-    update_path: &Path,
-    expected_sha256: &str,
-) -> Result<u64> {
-    let digest_hex = sha256_file(part_path)?;
-    if !digest_hex.eq_ignore_ascii_case(expected_sha256) {
-        let _ = fs::remove_file(part_path);
-        bail!(
-            "launcher update sha256 mismatch: expected {}, got {}",
-            expected_sha256,
-            digest_hex
-        );
-    }
-
-    let downloaded = fs::metadata(part_path)?.len();
-    remove_launcher_update_file_if_exists(update_path)?;
-    fs::rename(part_path, update_path).with_context(|| {
-        format!(
-            "promote verified launcher update from {} to {}",
-            part_path.display(),
-            update_path.display()
-        )
-    })?;
-    Ok(downloaded)
-}
-
-fn launcher_update_part_path(update_path: &Path) -> PathBuf {
-    let Some(file_name) = update_path.file_name() else {
-        return update_path.with_extension("part");
-    };
-    let mut part_name = file_name.to_os_string();
-    part_name.push(".part");
-    update_path.with_file_name(part_name)
-}
-
-fn remove_launcher_update_file_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn cleanup_launcher_update_download_files(part_path: &Path, update_path: &Path) {
-    for path in [part_path, update_path] {
-        if let Err(error) = remove_launcher_update_file_if_exists(path) {
-            warn!(
-                "Unable to clean launcher update download {}: {error}",
-                path.display()
-            );
-        }
-    }
-}
-
-fn download_launcher_update_sequential(
-    client: &Client,
-    url: &str,
-    update_path: &Path,
-    expected_total_bytes: Option<u64>,
-    mut status_updater: impl FnMut(SplashUpdate),
-) -> Result<u64> {
-    let mut response = client.get(url).send()?.error_for_status()?;
-    let total_bytes = expected_total_bytes.or_else(|| response.content_length());
-    let mut file = fs::File::create(update_path).with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = update_path.display().to_string()
-        )
-    })?;
-    let mut downloaded = 0u64;
-    let mut buffer = [0u8; 128 * 1024];
-    let mut last_reported_progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
-    let mut last_reported_at = Instant::now() - Duration::from_secs(1);
-    let download_started_at = Instant::now();
-
-    loop {
-        let size = response
-            .read(&mut buffer)
-            .with_context(|| t!("errors.download_update_failed", url = url))?;
-        if size == 0 {
-            break;
-        }
-        file.write_all(&buffer[..size]).with_context(|| {
-            t!(
-                "errors.write_update_failed",
-                error = update_path.display().to_string()
-            )
-        })?;
-        downloaded += size as u64;
-
-        let (progress, detail) =
-            launcher_download_progress_detail(downloaded, total_bytes, download_started_at);
-        if progress > last_reported_progress
-            || last_reported_at.elapsed() >= Duration::from_millis(250)
-        {
-            last_reported_progress = progress;
-            last_reported_at = Instant::now();
-            status_updater(
-                SplashUpdate::loading(t!("launcher_update.updating"), detail, progress)
-                    .with_subtitle(t!("launcher_update.status")),
-            );
-        }
-    }
-    file.flush().with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = update_path.display().to_string()
-        )
-    })?;
-
-    if let Some(total_bytes) = total_bytes {
-        if downloaded != total_bytes {
-            return Err(anyhow!(
-                "launcher update download incomplete: expected {} bytes, got {} bytes",
-                total_bytes,
-                downloaded
-            ));
-        }
-    }
-
-    Ok(downloaded)
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 128 * 1024];
-
-    loop {
-        let size = file.read(&mut buffer)?;
-        if size == 0 {
-            break;
-        }
-        hasher.update(&buffer[..size]);
-    }
-
-    let digest = hasher.finalize();
-    Ok(bytes_to_hex(&digest))
-}
-
-fn launcher_download_progress_detail(
-    downloaded: u64,
-    total_bytes: Option<u64>,
-    started_at: Instant,
-) -> (u8, String) {
-    let speed = format_speed(download_speed_bytes_per_second(downloaded, started_at));
-    if let Some(total) = total_bytes.filter(|total| *total > 0) {
-        let percentage = (downloaded.min(total).saturating_mul(100) / total) as u8;
-        let detail = t!(
-            "launcher_update.downloading_detail",
-            downloaded = format_bytes(downloaded),
-            total = format_bytes(total),
-            percent = percentage.to_string(),
-            speed = speed
-        )
-        .to_string();
-        let progress_span =
-            LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END - LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
-        let progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START
-            + ((u16::from(percentage) * u16::from(progress_span)) / 100) as u8;
-        return (progress, detail);
-    }
-
-    let mib_downloaded = downloaded / (1024 * 1024);
-    let progress = (LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START
-        + mib_downloaded.min(u64::from(
-            LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END - LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START,
-        )) as u8)
-        .min(LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END);
-    let detail = t!(
-        "launcher_update.downloading_detail_unknown",
-        downloaded = format_bytes(downloaded),
-        speed = speed
-    )
-    .to_string();
-    (progress, detail)
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-
-    let bytes_f = bytes as f64;
-    if bytes_f >= GIB {
-        format!("{:.1} GiB", bytes_f / GIB)
-    } else if bytes_f >= MIB {
-        format!("{:.1} MiB", bytes_f / MIB)
-    } else if bytes_f >= KIB {
-        format!("{:.1} KiB", bytes_f / KIB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn download_speed_bytes_per_second(downloaded: u64, started_at: Instant) -> f64 {
-    let elapsed = started_at.elapsed().as_secs_f64().max(0.1);
-    downloaded as f64 / elapsed
-}
-
-fn format_speed(bytes_per_second: f64) -> String {
-    format_bytes(bytes_per_second.max(0.0).round() as u64)
-}
-
-fn launcher_update_platform_key() -> &'static str {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "darwin-aarch64",
-        ("macos", "x86_64") => "darwin-x86_64",
-        ("linux", "x86_64") => "linux-x86_64",
-        ("linux", "aarch64") => "linux-aarch64",
-        ("windows", "x86_64") => "windows-x86_64",
-        ("windows", "x86") => "windows-i686",
-        ("windows", "aarch64") => "windows-aarch64",
-        _ => "unknown",
-    }
-}
-
-fn launcher_version_is_newer(current: &str, latest: &str) -> Option<bool> {
-    let current = parse_launcher_version(current)?;
-    let latest = parse_launcher_version(latest)?;
-    Some(latest > current)
-}
-
-fn parse_launcher_version(version: &str) -> Option<(u64, u64, u64, u64)> {
-    let version = version.strip_prefix('v').unwrap_or(version);
-    let version = match version.split_once('+') {
-        Some((version, build_metadata)) if valid_launcher_version_suffix(build_metadata) => version,
-        Some(_) => return None,
-        None => version,
-    };
-    let (core, suffix) = version.split_once('-').unwrap_or((version, ""));
-    if version.contains('-') && !valid_launcher_version_suffix(suffix) {
-        return None;
-    }
-    let mut nums = core.split('.');
-    let major = nums.next()?.parse::<u64>().ok()?;
-    let minor = nums.next()?.parse::<u64>().ok()?;
-    let patch = nums.next()?.parse::<u64>().ok()?;
-    if nums.next().is_some() {
-        return None;
-    }
-    let suffix_rank = suffix
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>()
-        .parse::<u64>()
-        .unwrap_or(0);
-    Some((major, minor, patch, suffix_rank))
-}
-
-fn valid_launcher_version_suffix(value: &str) -> bool {
-    !value.is_empty()
-        && value.split('.').all(|identifier| {
-            !identifier.is_empty()
-                && identifier
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        })
-}
-
+/// 构造更新请求的公共 HTTP 头：伪装成 Chrome 浏览器并附带语言偏好，
+/// 以通过 CDN/网关的默认访问规则。
 fn launcher_arg_present(flags: &[&str]) -> bool {
     std::env::args().skip(1).any(|arg| {
         let arg = arg.to_ascii_lowercase();
@@ -1261,1304 +314,20 @@ fn launcher_arg_present(flags: &[&str]) -> bool {
     })
 }
 
-fn preview_no_update_arg_present() -> bool {
-    launcher_arg_present(PREVIEW_NO_UPDATE_ARGS)
-}
-
-fn preview_crash_arg_present() -> bool {
-    launcher_arg_present(PREVIEW_CRASH_ARGS)
-}
-
+/// 是否以"启动后最小化到托盘"模式启动。
 fn start_minimized_arg_present() -> bool {
     launcher_arg_present(START_MINIMIZED_ARGS)
 }
 
-fn launcher_update_temp_path(current_exe: &Path) -> PathBuf {
-    let file_name = current_exe
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("alas-launcher");
-    std::env::temp_dir().join(format!(
-        "azurpilot-launcher-update-{}-{file_name}",
-        std::process::id()
-    ))
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
-
-fn make_executable(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_launcher_and_restart(current_exe: &Path, update_path: &Path) -> Result<()> {
-    fs::rename(update_path, current_exe).with_context(|| {
-        t!(
-            "errors.replace_launcher_failed",
-            error = current_exe.display().to_string()
-        )
-    })?;
-    Command::new(current_exe)
-        .env(LAUNCHER_UPDATE_SKIP_ENV, "1")
-        .spawn()
-        .with_context(|| {
-            t!(
-                "errors.restart_launcher_failed",
-                error = current_exe.display().to_string()
-            )
-        })?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_launcher_and_restart(current_exe: &Path, update_path: &Path) -> Result<()> {
-    let helper_path = std::env::temp_dir().join(format!(
-        "azurpilot-launcher-update-helper-{}.exe",
-        std::process::id()
-    ));
-
-    fs::copy(current_exe, &helper_path).with_context(|| {
-        t!(
-            "errors.copy_file_failed",
-            src = current_exe.display().to_string(),
-            dest = helper_path.display().to_string()
-        )
-    })?;
-
-    use std::os::windows::process::CommandExt;
-    use winapi::um::winbase::CREATE_NO_WINDOW;
-    Command::new(&helper_path)
-        .arg(LAUNCHER_UPDATE_APPLY_ARG)
-        .arg(current_exe)
-        .arg(update_path)
-        .env(LAUNCHER_UPDATE_SKIP_ENV, "1")
-        .env(LAUNCHER_UPDATE_NO_CONSOLE_ENV, "1")
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .with_context(|| {
-            t!(
-                "errors.start_update_script_failed",
-                error = helper_path.display().to_string()
-            )
-        })?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn try_apply_launcher_update_from_args() -> Result<bool> {
-    use std::ffi::OsStr;
-
-    let mut args = std::env::args_os();
-    let _ = args.next();
-    let Some(mode) = args.next() else {
-        return Ok(false);
-    };
-    if mode != OsStr::new(LAUNCHER_UPDATE_APPLY_ARG) {
-        return Ok(false);
-    }
-
-    let target_path = args
-        .next()
-        .ok_or_else(|| anyhow!("missing launcher update target path"))?;
-    let update_path = args
-        .next()
-        .ok_or_else(|| anyhow!("missing launcher update payload path"))?;
-    apply_launcher_update_and_restart(PathBuf::from(target_path), PathBuf::from(update_path))?;
-    Ok(true)
-}
-
-#[cfg(windows)]
-fn apply_launcher_update_and_restart(target_path: PathBuf, update_path: PathBuf) -> Result<()> {
-    let mut last_error = None;
-    for _ in 0..60 {
-        match move_file_replace(&update_path, &target_path) {
-            Ok(()) => {
-                restart_launcher_after_update(&target_path)?;
-                schedule_file_delete_on_reboot(&std::env::current_exe()?);
-                return Ok(());
-            }
-            Err(err) => {
-                last_error = Some(err);
-                thread::sleep(Duration::from_secs(1));
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow!("launcher update replacement timed out")))
-}
-
-#[cfg(windows)]
-fn move_file_replace(from: &Path, to: &Path) -> Result<()> {
-    use winapi::um::winbase::{
-        MoveFileExW, MOVEFILE_COPY_ALLOWED, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let from_wide = path_to_wide(from);
-    let to_wide = path_to_wide(to);
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH;
-    let moved = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) };
-    if moved == 0 {
-        return Err(anyhow!(
-            "{}: {}",
-            t!(
-                "errors.replace_launcher_failed",
-                error = to.display().to_string()
-            ),
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn restart_launcher_after_update(target_path: &Path) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    use winapi::um::winbase::CREATE_NO_WINDOW;
-
-    Command::new(target_path)
-        .env(LAUNCHER_UPDATE_SKIP_ENV, "1")
-        .env(LAUNCHER_UPDATE_NO_CONSOLE_ENV, "1")
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .with_context(|| {
-            t!(
-                "errors.restart_launcher_failed",
-                error = target_path.display().to_string()
-            )
-        })?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn schedule_file_delete_on_reboot(path: &Path) {
-    use std::ptr;
-    use winapi::um::winbase::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
-
-    let path_wide = path_to_wide(path);
-    let _ = unsafe { MoveFileExW(path_wide.as_ptr(), ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
-}
-
-#[cfg(windows)]
-fn path_to_wide(path: &Path) -> Vec<u16> {
-    use std::{iter, os::windows::ffi::OsStrExt};
-
-    path.as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_time_bomb_config_parses_when_enabled() {
-        let section =
-            cargo_toml_section("package.metadata.alas-launcher.time-bomb").expect("section exists");
-        let enabled = cargo_toml_value(section, "enabled").as_deref() == Some("true");
-        let config = time_bomb_config().expect("time bomb config parses");
-        assert_eq!(config.is_some(), enabled);
-    }
-
-    #[test]
-    fn test_cargo_toml_value_reads_time_bomb_fields() {
-        let section =
-            cargo_toml_section("package.metadata.alas-launcher.time-bomb").expect("section exists");
-        assert!(cargo_toml_value(section, "expires-at").is_some());
-        assert_eq!(
-            Some("测试已结束，请安装正式版".to_owned()),
-            cargo_toml_value(section, "message")
-        );
-    }
-
-    #[test]
-    fn test_english_splash_i18n_uses_json_literals() {
-        rust_i18n::set_locale("en");
-
-        let html = splash_redesigned_shell_html("video", "font");
-
-        assert!(html.contains(r#""defaultTip":"Sakura Empire's cherry blossoms"#));
-        assert!(!html.contains("const defaultTip = '"));
-        assert!(html.contains("window.__ALAS_SPLASH_READY = true;"));
-        assert!(html.contains("data:video/mp4;base64,video"));
-        assert!(html.contains("font-family: \"MiSans\""));
-        assert!(html.contains("data:font/ttf;base64,font"));
-        assert!(!html.contains("text-transform: uppercase;"));
-    }
-
-    #[test]
-    fn test_splash_includes_optional_uv_progress() {
-        let html = splash_redesigned_shell_html("video", "font");
-
-        assert!(html.contains("data:video/mp4;base64,video"));
-        assert!(html.contains("id=\"uv-progress-container\""));
-        assert!(html.contains("payload.uv_progress"));
-        assert!(html.contains("id=\"uv-progress-detail\""));
-        assert!(html.contains("grid-template-columns: minmax(0, 1fr) auto"));
-        assert!(html.contains("background: rgba(250, 250, 247, 0.78)"));
-        assert!(html.contains("content: \"✦\""));
-        assert!(!html.contains("'Tips: ' + subtitle.tip"));
-        assert!(!html.contains("animation: sweep"));
-    }
-
-    #[test]
-    fn test_truncate_log_file_replaces_existing_contents() {
-        let temp_dir = TempDirBuilder::new()
-            .prefix("launcher-log-truncate-test-")
-            .tempdir()
-            .expect("create temporary log directory");
-        let filename = "launcher.txt";
-        let path = temp_dir.path().join(filename);
-        fs::write(&path, "old launcher log").expect("write old log");
-
-        truncate_log_file(temp_dir.path(), filename).expect("truncate launcher log");
-
-        assert_eq!(fs::read(&path).expect("read truncated log"), b"");
-    }
-
-    #[test]
-    fn test_titlebars_use_webview_draggable_regions_for_touch_dragging() {
-        let splash_html = splash_redesigned_shell_html("video", "font");
-
-        assert!(splash_html.contains("touch-action: none;"));
-        assert!(splash_html.contains("addEventListener('pointerdown'"));
-        assert!(splash_html.contains("-webkit-app-region: drag;"));
-        assert!(splash_html.contains("-webkit-app-region: no-drag;"));
-        assert!(splash_html.contains("webviewDraggableRegionsEnabled"));
-        assert!(splash_html.contains("if (webviewDraggableRegionsEnabled) {"));
-        assert!(!splash_html.contains("$NATIVE_TOUCH_DRAG"));
-
-        #[cfg(windows)]
-        assert!(splash_html.contains("const webviewDraggableRegionsEnabled = true;"));
-
-        #[cfg(not(target_os = "macos"))]
-        let titlebar_script = main_window_titlebar_injection_script();
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert!(titlebar_script.contains("touch-action:none"));
-            assert!(titlebar_script.contains("addEventListener('pointerdown'"));
-            assert!(titlebar_script.contains("-webkit-app-region:drag"));
-            assert!(titlebar_script.contains("-webkit-app-region:no-drag"));
-            assert!(titlebar_script.contains("webviewDraggableRegionsEnabled"));
-            assert!(titlebar_script.contains("if (webviewDraggableRegionsEnabled)"));
-            assert!(titlebar_script.contains(
-                ".alas-titlebar-drag-zone{position:absolute;inset:0 148px 0 0;height:100%;pointer-events:none"
-            ));
-            assert!(titlebar_script.contains(".alas-titlebar-drag-segment{"));
-            assert!(titlebar_script.contains("const rebuildDragSegments = () =>"));
-            assert!(titlebar_script.contains("getComputedStyle(element).cursor !== 'pointer'"));
-            assert!(titlebar_script.contains("dragZone.replaceChildren(fragment)"));
-            assert!(titlebar_script.contains("min-height:28px"));
-            assert!(titlebar_script.contains("background:rgba(250,250,247,.78)"));
-            assert!(titlebar_script.contains(".icon-close{color:#e64f58}"));
-            assert!(titlebar_script.contains("--alas-titlebar-height:56px"));
-            assert!(titlebar_script.contains("transform:translateY(-6px) scale(.96)"));
-            assert!(!titlebar_script.contains("scale(.72)"));
-            assert!(titlebar_script.contains("alas-close-menu"));
-            assert!(!titlebar_script.contains("alas-close-optics"));
-            assert!(!titlebar_script.contains("alas-island-open"));
-            assert!(titlebar_script.contains("__ALAS_OPEN_CLOSE_PROMPT"));
-            assert!(titlebar_script.contains("window_exit_application"));
-            #[cfg(windows)]
-            assert!(titlebar_script.contains("const webviewDraggableRegionsEnabled = true;"));
-        }
-    }
-
-    #[test]
-    fn test_windows_enable_webview_draggable_regions() {
-        let config: serde_json::Value =
-            serde_json::from_str(TAURI_CONFIG_SOURCE).expect("valid config");
-        let windows = config["app"]["windows"].as_array().expect("window configs");
-
-        for window in windows {
-            let args = window["additionalBrowserArgs"]
-                .as_str()
-                .expect("draggable regions arguments");
-            assert!(args.contains("msWebView2EnableDraggableRegions"));
-            assert!(args.contains("ElasticOverscroll"));
-            assert!(args.contains("msWebOOUI,msPdfOOUI,msSmartScreenProtection"));
-            assert!(args.contains("--no-proxy-server"));
-        }
-    }
-
-    #[test]
-    fn test_launcher_update_versions_must_be_valid() {
-        assert_eq!(launcher_version_is_newer("2.1.6", "2.1.7"), Some(true));
-        assert_eq!(
-            launcher_version_is_newer("2.1.6", "2.1.6+build.1"),
-            Some(false)
-        );
-        assert_eq!(launcher_version_is_newer("2.1.6", "not-a-version"), None);
-        assert_eq!(launcher_version_is_newer("2.1", "2.1.7"), None);
-        assert_eq!(launcher_version_is_newer("2.1.6", "2.1.7-"), None);
-    }
-
-    #[test]
-    fn test_launcher_update_manifest_uses_fallback_url() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let server = std::thread::spawn(move || {
-            let fallback_body = r#"{"version":"2.1.8","platforms":{}}"#;
-            let responses = [
-                (
-                    "/primary",
-                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_owned(),
-                ),
-                (
-                    "/fallback",
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
-                        fallback_body.len()
-                    ),
-                ),
-            ];
-
-            for (expected_path, response) in responses {
-                let (mut stream, _) = listener.accept().expect("accept manifest request");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("set read timeout");
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0u8; 1024];
-                    let read = stream.read(&mut buffer).expect("read manifest request");
-                    assert!(read > 0, "manifest request ended before headers");
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&request);
-                assert!(request.starts_with(&format!("GET {expected_path} ")));
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("write manifest response");
-            }
-        });
-
-        let client = Client::builder().no_proxy().build().expect("build client");
-        let primary = format!("http://{address}/primary");
-        let fallback = format!("http://{address}/fallback");
-        let manifest = fetch_launcher_update_manifest_from_urls(&client, &[&primary, &fallback])
-            .expect("fetch manifest from fallback");
-
-        assert_eq!(manifest.version, "2.1.8");
-        server.join().expect("manifest server completed");
-    }
-
-    #[test]
-    fn test_launcher_update_payload_requires_https_and_sha256() {
-        let digest = "a".repeat(64);
-
-        assert!(
-            validate_launcher_update_payload("https://updates.example/launcher", &digest).is_ok()
-        );
-        assert!(
-            validate_launcher_update_payload("http://updates.example/launcher", &digest).is_err()
-        );
-        assert!(validate_launcher_update_payload(
-            "https://updates.example/launcher",
-            "not-a-digest"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn test_launcher_update_byte_ranges_cover_payload_once() {
-        let total_bytes = LAUNCHER_UPDATE_MIN_CHUNK_BYTES * 8 + 17;
-        let ranges = launcher_update_byte_ranges(total_bytes);
-
-        assert_eq!(ranges.len(), LAUNCHER_UPDATE_MAX_CONNECTIONS);
-        assert_eq!(ranges.first().map(|range| range.start), Some(0));
-        assert_eq!(ranges.last().map(|range| range.end), Some(total_bytes - 1));
-        assert_eq!(
-            ranges
-                .iter()
-                .map(|range| range.end - range.start + 1)
-                .sum::<u64>(),
-            total_bytes
-        );
-        assert!(ranges
-            .windows(2)
-            .all(|pair| pair[0].end + 1 == pair[1].start));
-    }
-
-    #[test]
-    fn test_launcher_update_content_range_parser() {
-        assert_eq!(
-            parse_launcher_update_content_range("bytes 10-19/42"),
-            Some((10, 19, 42))
-        );
-        assert_eq!(parse_launcher_update_content_range("bytes 0-0/*"), None);
-        assert_eq!(parse_launcher_update_content_range("bytes 19-10/42"), None);
-        assert_eq!(parse_launcher_update_content_range("not-a-range"), None);
-    }
-
-    #[test]
-    fn test_launcher_update_range_probe_falls_back_when_ignored() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept range probe");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("set read timeout");
-            let mut request = Vec::new();
-            loop {
-                let mut buffer = [0u8; 1024];
-                let read = stream.read(&mut buffer).expect("read range probe");
-                assert!(read > 0, "range probe ended before headers");
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            assert!(String::from_utf8_lossy(&request)
-                .lines()
-                .any(|line| line.eq_ignore_ascii_case("range: bytes=0-0")));
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("write range probe response");
-        });
-
-        let client = Client::builder().no_proxy().build().expect("build client");
-        let url = format!("http://{address}/launcher");
-        assert_eq!(
-            launcher_update_range_total(&client, &url).expect("probe range support"),
-            None
-        );
-        server.join().expect("range probe server completed");
-    }
-
-    #[test]
-    fn test_parallel_launcher_update_download_merges_ranges() {
-        let payload: Vec<u8> = (0..(LAUNCHER_UPDATE_MIN_CHUNK_BYTES * 2 + 17))
-            .map(|index| (index % 251) as u8)
-            .collect();
-        let payload = Arc::new(payload);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let request_count = launcher_update_byte_ranges(payload.len() as u64).len() + 1;
-        let server_payload = Arc::clone(&payload);
-        let server = std::thread::spawn(move || {
-            for _ in 0..request_count {
-                let (mut stream, _) = listener.accept().expect("accept range request");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("set read timeout");
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0u8; 1024];
-                    let read = stream.read(&mut buffer).expect("read range request");
-                    assert!(read > 0, "range request ended before headers");
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-
-                let request = String::from_utf8_lossy(&request);
-                let range = request
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        if name.eq_ignore_ascii_case("range") {
-                            value.trim().strip_prefix("bytes=")
-                        } else {
-                            None
-                        }
-                    })
-                    .expect("range request header");
-                let (start, end) = range.split_once('-').expect("range bounds");
-                let start: usize = start.parse().expect("range start");
-                let end: usize = end.parse().expect("range end");
-                assert!(start <= end && end < server_payload.len());
-                let body = &server_payload[start..=end];
-                let response = format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
-                    body.len(),
-                    start,
-                    end,
-                    server_payload.len()
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("write headers");
-                stream.write_all(body).expect("write range body");
-            }
-        });
-
-        let client = Client::builder().no_proxy().build().expect("build client");
-        let url = format!("http://{address}/launcher");
-        let temp_dir = TempDirBuilder::new()
-            .prefix("launcher-range-test-")
-            .tempdir()
-            .unwrap();
-        let part_path = temp_dir.path().join("launcher.part");
-        let total_bytes = launcher_update_range_total(&client, &url)
-            .expect("probe range support")
-            .expect("server supports ranges");
-        let ranges = launcher_update_byte_ranges(total_bytes);
-        let mut progress = Vec::new();
-
-        let downloaded = download_launcher_update_parallel(
-            &client,
-            &url,
-            total_bytes,
-            &ranges,
-            &part_path,
-            &mut |update| progress.push(update.progress),
-        )
-        .expect("parallel launcher download");
-
-        assert_eq!(downloaded, payload.len() as u64);
-        let merged = fs::read(&part_path).expect("read merged file");
-        assert_eq!(merged.as_slice(), payload.as_slice());
-        assert!(progress
-            .iter()
-            .any(|value| *value > LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START));
-        server.join().expect("range server completed");
-    }
-
-    #[test]
-    fn test_launcher_update_promotion_requires_valid_digest() {
-        let temp_dir = TempDirBuilder::new()
-            .prefix("launcher-promotion-test-")
-            .tempdir()
-            .unwrap();
-        let part_path = temp_dir.path().join("launcher.part");
-        let update_path = temp_dir.path().join("launcher.update");
-        fs::write(&part_path, b"verified update").expect("write update part");
-        let digest = sha256_file(&part_path).expect("hash update part");
-
-        assert_eq!(
-            verify_and_promote_launcher_update(&part_path, &update_path, &digest)
-                .expect("promote verified update"),
-            b"verified update".len() as u64
-        );
-        assert!(!part_path.exists());
-        assert_eq!(
-            fs::read(&update_path).expect("read promoted update"),
-            b"verified update"
-        );
-
-        let failed_part_path = temp_dir.path().join("failed.part");
-        let failed_update_path = temp_dir.path().join("failed.update");
-        fs::write(&failed_part_path, b"unverified update").expect("write failed update part");
-        assert!(verify_and_promote_launcher_update(
-            &failed_part_path,
-            &failed_update_path,
-            &"0".repeat(64),
-        )
-        .is_err());
-        assert!(!failed_part_path.exists());
-        assert!(!failed_update_path.exists());
-    }
-}
-
-/// Set macOS activation policy to Regular (show in dock) or Accessory (hide from dock).
-#[cfg(target_os = "macos")]
-fn set_macos_activation_policy(app: &tauri::AppHandle, regular: bool) {
-    let policy = if regular {
-        tauri::ActivationPolicy::Regular
-    } else {
-        tauri::ActivationPolicy::Accessory
-    };
-    if let Err(e) = app.set_activation_policy(policy) {
-        error!("Failed to set activation policy: {}", e);
-    }
-}
-
-#[cfg(windows)]
-fn prompt_for_missing_nodejs(
-    app_handle: &tauri::AppHandle,
-    splash: &WebviewWindow,
-    mut status_updater: &mut impl FnMut(SplashUpdate),
-    cancel_requested: &AtomicBool,
-    start_minimized: bool,
-) -> bool {
-    if crate::nodejs::is_nodejs_available() {
-        return true;
-    }
-    if cancel_requested.load(Ordering::SeqCst) {
-        return false;
-    }
-
-    warn!("Node.js was not found on this Windows system");
-    if start_minimized {
-        let _ = reveal_window(splash);
-    }
-    status_updater(SplashUpdate::loading(
-        t!("setup.checking_nodejs"),
-        t!("setup.checking_nodejs"),
-        5,
-    ));
-
-    let install_requested = app_handle
-        .dialog()
-        .message(t!("dialog.nodejs_missing_message"))
-        .title(t!("dialog.nodejs_missing_title"))
-        .kind(MessageDialogKind::Warning)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            t!("dialog.nodejs_install").to_string(),
-            t!("dialog.nodejs_not_now").to_string(),
-        ))
-        .parent(splash)
-        .blocking_show();
-    if !install_requested {
-        info!("Node.js installation was declined by the user");
-        return true;
-    }
-
-    match crate::nodejs::install_nodejs(cancel_requested, &mut status_updater) {
-        Ok(()) => {
-            info!("Node.js installation completed successfully");
-            true
-        }
-        Err(_) if cancel_requested.load(Ordering::SeqCst) => false,
-        Err(error) => {
-            error!("Node.js installation failed: {error:#}");
-            status_updater(SplashUpdate::error(
-                t!("dialog.nodejs_install_failed"),
-                t!(
-                    "dialog.nodejs_install_failed_detail",
-                    error = format!("{error:#}")
-                ),
-                7,
-            ));
-            app_handle
-                .dialog()
-                .message(t!(
-                    "dialog.nodejs_install_failed_detail",
-                    error = format!("{error:#}")
-                ))
-                .title(t!("dialog.nodejs_install_failed"))
-                .kind(MessageDialogKind::Error)
-                .parent(splash)
-                .blocking_show();
-            true
-        }
-    }
-}
-
 fn main() -> Result<()> {
-    #[cfg(windows)]
-    if try_apply_launcher_update_from_args()? {
-        return Ok(());
-    }
-
-    #[cfg(windows)]
-    unsafe {
-        use crate::window_util::HAS_CONSOLE;
-        use std::sync::atomic::Ordering;
-        use winapi::um::wincon::{AttachConsole, ATTACH_PARENT_PROCESS};
-        if std::env::var_os(LAUNCHER_UPDATE_NO_CONSOLE_ENV).is_some() {
-            std::env::remove_var(LAUNCHER_UPDATE_NO_CONSOLE_ENV);
-        } else {
-            HAS_CONSOLE.store(AttachConsole(ATTACH_PARENT_PROCESS) != 0, Ordering::Relaxed);
-        }
-    }
-    setup_environment()?;
-    let _log_guard = initialize_logging()?;
-    crate::i18n::init();
-    let preview_crash = preview_crash_arg_present();
-    let preview_no_update = preview_crash || preview_no_update_arg_present();
-    let start_minimized = start_minimized_arg_present();
-
-    info!("=== AzurPilot starting ===");
-    info!("Launcher log file: log/{}", today_launcher_log_filename());
-    if preview_no_update {
-        info!("Preview no-update mode enabled; skipping launcher update check");
-    }
-    if preview_crash {
-        info!("Preview crash mode enabled; splash will stop on an artificial error state");
-    }
-    if start_minimized {
-        info!("Start minimized mode enabled; main window will stay in tray after backend is ready");
-    }
-
-    let deploy_config = get_deploy_config();
-    let webui_config = WebuiLaunchConfig::from_deploy_config(deploy_config.as_ref());
-    if deploy_config.is_none() {
-        warn!("config/deploy.yaml not found or invalid, using default WebUI launch config");
-    }
-    let port = webui_config.port;
-
-    let backend = Arc::new(Mutex::new(None));
-    let allow_exit = Arc::new(AtomicBool::new(false));
-    let launch_blocked = Arc::new(AtomicBool::new(false));
-    let setup_cancel_requested = Arc::new(AtomicBool::new(false));
-    let setup_running = Arc::new(AtomicBool::new(false));
-    let setup_completed = Arc::new(AtomicBool::new(false));
-    let startup_cleanup_started = Arc::new(AtomicBool::new(false));
-    let recreating_main_window = Arc::new(AtomicBool::new(false));
-
-    let allow_exit_for_setup = allow_exit.clone();
-    let launch_blocked_for_setup = launch_blocked.clone();
-    let recreating_main_window_for_single_instance = recreating_main_window.clone();
-    let recreating_main_window_for_setup = recreating_main_window.clone();
-    let recreating_main_window_for_run = recreating_main_window.clone();
-    let launch_blocked_for_run = launch_blocked.clone();
-    let start_minimized_for_run = start_minimized;
-
-    info!("Starting Webview...");
-    tauri::Builder::default()
-        .register_uri_scheme_protocol("alas-error", |_ctx, request| {
-            backend_error_response(request)
-        })
-        .register_uri_scheme_protocol("alas-splash", |_ctx, _request| splash_response())
-        .manage(ExitControl(allow_exit.clone()))
-        .invoke_handler(tauri::generate_handler![
-            save_as,
-            download_today_gui_log,
-            download_today_launcher_log,
-            retry_backend_connection,
-            window_hide,
-            window_minimize,
-            window_toggle_maximize,
-            window_close,
-            window_exit_application,
-            window_start_dragging,
-            window_is_maximized
-        ])
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_single_instance::init(
-            move |app, _argv, _cwd| {
-                restore_main_window_from_tray(
-                    app,
-                    port,
-                    recreating_main_window_for_single_instance.clone(),
-                );
-            },
-        ))
-        .setup(move |app| {
-            match time_bomb_expiration_message() {
-                Ok(Some(message)) => {
-                    launch_blocked_for_setup.store(true, Ordering::SeqCst);
-                    allow_exit_for_setup.store(true, Ordering::SeqCst);
-                    let app_handle = app.handle().clone();
-                    app.dialog()
-                        .message(message)
-                        .title(t!("dialog.test_ended"))
-                        .show(move |_| {
-                            app_handle.exit(0);
-                        });
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!("Unable to verify test expiration time: {:?}", err);
-                }
-            }
-
-            create_main_window(&app.handle(), port)?;
-
-            // Windows and macOS: create system tray
-            #[cfg(any(windows, target_os = "macos"))]
-            {
-                info!("Creating system tray...");
-                let allow_exit = allow_exit_for_setup.clone();
-                let recreating_main_window_for_menu = recreating_main_window_for_setup.clone();
-                #[cfg(windows)]
-                let recreating_main_window_for_tray = recreating_main_window_for_setup.clone();
-                let show_item = MenuItemBuilder::new(t!("tray.toggle_visibility"))
-                    .id("toggle_visibility")
-                    .build(app)?;
-                let quit_item = MenuItemBuilder::new(t!("tray.quit"))
-                    .id("quit")
-                    .build(app)?;
-                let tray_menu = MenuBuilder::new(app)
-                    .item(&show_item)
-                    .separator()
-                    .item(&quit_item)
-                    .build()?;
-
-                info!("Tray menu created successfully");
-
-                // Use embedded icon bytes so packaged apps always load the tray icon correctly.
-                let icon = tray_icon_for_platform();
-
-                info!("Building tray icon...");
-                let mut tray_builder = TrayIconBuilder::with_id("main-tray")
-                    .icon(icon)
-                    .tooltip("AzurPilot")
-                    .menu(&tray_menu);
-
-                // On Windows, show menu on right click
-                #[cfg(windows)]
-                {
-                    tray_builder = tray_builder.show_menu_on_left_click(false);
-                }
-
-                // On macOS, show menu on left click
-                #[cfg(target_os = "macos")]
-                {
-                    info!("Setting macOS tray to show menu on left click");
-                    tray_builder = tray_builder.show_menu_on_left_click(true);
-                }
-
-                match tray_builder
-                    .on_menu_event(move |app, event| {
-                        debug!("Tray menu event: {:?}", event.id());
-                        match event.id().as_ref() {
-                            "toggle_visibility" => {
-                                toggle_main_window_visibility(
-                                    app,
-                                    port,
-                                    recreating_main_window_for_menu.clone(),
-                                );
-                            }
-                            "quit" => {
-                                allow_exit.store(true, Ordering::SeqCst);
-                                app.exit(0);
-                            }
-                            _ => {}
-                        }
-                    })
-                    .on_tray_icon_event(move |tray, event| {
-                        #[cfg(windows)]
-                        if let tauri::tray::TrayIconEvent::Click {
-                            button: tauri::tray::MouseButton::Left,
-                            button_state: tauri::tray::MouseButtonState::Up,
-                            ..
-                        } = event
-                        {
-                            let app = tray.app_handle();
-                            toggle_main_window_visibility(
-                                &app,
-                                port,
-                                recreating_main_window_for_tray.clone(),
-                            );
-                        }
-
-                        #[cfg(target_os = "macos")]
-                        {
-                            let _ = tray;
-                            let _ = event;
-                        }
-                    })
-                    .build(app)
-                {
-                    Ok(_) => {
-                        info!("System tray created successfully!");
-                    }
-                    Err(e) => {
-                        error!("Failed to create system tray: {:?}", e);
-                        return Err(Box::new(e));
-                    }
-                }
-            }
-
-            Ok(())
-        })
-        .build(tauri::generate_context!())?
-        .run(move |app_handle, event| {
-            match event {
-                tauri::RunEvent::Ready => {
-                    if launch_blocked_for_run.load(Ordering::SeqCst) {
-                        debug!("Launch blocked by test expiration");
-                        return;
-                    }
-
-                    debug!("RunEvent::Ready");
-                    let allow_exit = allow_exit.clone();
-                    let allow_exit_for_ctrlc = allow_exit.clone();
-                    let handle1 = app_handle.clone();
-                    ctrlc::set_handler(move || {
-                        allow_exit_for_ctrlc.store(true, Ordering::SeqCst);
-                        handle1.exit(0);
-                    })
-                    .expect("Error setting Ctrl-C handler");
-                    let app_handle = app_handle.clone();
-                    let backend = backend.clone();
-                    let webui_config = webui_config.clone();
-                    let setup_cancel_requested = setup_cancel_requested.clone();
-                    let setup_running = setup_running.clone();
-                    let setup_completed = setup_completed.clone();
-                    let recreating_main_window_for_notify = recreating_main_window_for_run.clone();
-                    let start_minimized = start_minimized_for_run;
-                    thread::spawn(move || {
-                        setup_running.store(true, Ordering::SeqCst);
-                        let splash = app_handle.get_webview_window("splash").unwrap();
-                        initialize_splash(&splash, !start_minimized);
-                        let last_progress = Cell::new(0u8);
-                        let mut status_updater = |mut update: SplashUpdate| {
-                            update.progress = update.progress.max(last_progress.get());
-                            last_progress.set(update.progress);
-                            update_splash(&splash, &update);
-                        };
-
-                        status_updater(
-                            SplashUpdate::loading(
-                                t!("splash.starting"),
-                                t!("splash.webui_init"),
-                                4,
-                            )
-                            .with_subtitle(format!(
-                                "{} | Tips:{}",
-                                t!("splash.initializing"),
-                                crate::setup::get_tip()
-                            )),
-                        );
-
-                        if !preview_no_update {
-                            let launcher_progress = Cell::new(0u8);
-                            let mut launcher_status_updater = |mut update: SplashUpdate| {
-                                update.progress = update.progress.max(launcher_progress.get());
-                                launcher_progress.set(update.progress);
-                                update_splash(&splash, &update);
-                            };
-
-                            match check_launcher_update_and_restart(&mut launcher_status_updater) {
-                                Ok(true) => {
-                                    info!("Launcher update installed, restarting");
-                                    setup_completed.store(true, Ordering::SeqCst);
-                                    setup_running.store(false, Ordering::SeqCst);
-                                    allow_exit.store(true, Ordering::SeqCst);
-                                    app_handle.exit(0);
-                                    return;
-                                }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    warn!("Required launcher update failed: {e:#}");
-                                    if start_minimized {
-                                        let _ = reveal_window(&splash);
-                                    }
-                                    launcher_status_updater(SplashUpdate::error(
-                                        t!("launcher_update.failed"),
-                                        t!(
-                                            "launcher_update.failed_detail",
-                                            error = format!("{e:#}")
-                                        ),
-                                        launcher_progress.get().max(8),
-                                    ));
-                                    setup_completed.store(true, Ordering::SeqCst);
-                                    setup_running.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            }
-                        }
-
-                        if preview_crash {
-                            if start_minimized {
-                                let _ = reveal_window(&splash);
-                            }
-                            status_updater(
-                                SplashUpdate::error(
-                                    t!("dialog.startup_failed"),
-                                    t!("splash.preview_crash_detail"),
-                                    42,
-                                )
-                                .with_subtitle(format!(
-                                    "{} | Tips：{}",
-                                    t!("splash.preview_crash_mode"),
-                                    crate::setup::get_tip()
-                                )),
-                            );
-                            setup_completed.store(true, Ordering::SeqCst);
-                            setup_running.store(false, Ordering::SeqCst);
-                            return;
-                        }
-
-                        #[cfg(windows)]
-                        if !prompt_for_missing_nodejs(
-                            &app_handle,
-                            &splash,
-                            &mut status_updater,
-                            &setup_cancel_requested,
-                            start_minimized,
-                        ) {
-                            setup_running.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                        if setup_cancel_requested.load(Ordering::SeqCst) {
-                            setup_running.store(false, Ordering::SeqCst);
-                            return;
-                        }
-
-                        if let Err(e) = setup_alas_repo(
-                            &mut status_updater,
-                            setup_cancel_requested.clone(),
-                            preview_no_update,
-                        ) {
-                            error!("{e}");
-                            setup_running.store(false, Ordering::SeqCst);
-                            if setup_cancel_requested.load(Ordering::SeqCst) {
-                                return;
-                            }
-                            if start_minimized {
-                                let _ = reveal_window(&splash);
-                            }
-                            status_updater(SplashUpdate::error(
-                                t!("dialog.startup_failed"),
-                                t!("dialog.repo_setup_failed", error = e.to_string()),
-                                last_progress.get().max(8),
-                            ));
-                            return;
-                        }
-                        info!("Starting gui.py on http://127.0.0.1:{}/", port);
-                        status_updater(
-                            SplashUpdate::loading(
-                                t!("splash.starting"),
-                                t!("splash.webui_init_slow"),
-                                97,
-                            )
-                            .with_subtitle(format!(
-                                "{} | Tips:{}",
-                                t!("splash.starting_backend"),
-                                crate::setup::get_tip()
-                            )),
-                        );
-                        let mut backend_recovery_used = false;
-                        let backend_result = loop {
-                            match ManagedBackend::new(&webui_config) {
-                                Ok(backend) => break Ok(backend),
-                                Err(error)
-                                    if !backend_recovery_used
-                                        && is_backend_startup_timeout(&error) =>
-                                {
-                                    backend_recovery_used = true;
-                                    if setup_cancel_requested.load(Ordering::SeqCst) {
-                                        break Err(error);
-                                    }
-
-                                    warn!(
-                                        "Backend startup timed out; rebuilding .venv and retrying once"
-                                    );
-                                    if let Err(recovery_error) = rebuild_venv_and_sync_dependencies(
-                                        &mut status_updater,
-                                        setup_cancel_requested.clone(),
-                                    ) {
-                                        break Err(recovery_error.context(
-                                            "Failed to rebuild .venv after backend startup timeout",
-                                        ));
-                                    }
-
-                                    info!(
-                                        "Retrying gui.py after rebuilding dependencies on http://127.0.0.1:{port}/"
-                                    );
-                                    status_updater(
-                                        SplashUpdate::loading(
-                                            t!("splash.starting"),
-                                            t!("splash.webui_init_slow"),
-                                            97,
-                                        )
-                                        .with_subtitle(format!(
-                                            "{} | Tips:{}",
-                                            t!("splash.starting_backend"),
-                                            crate::setup::get_tip()
-                                        )),
-                                    );
-                                }
-                                Err(error) => break Err(error),
-                            }
-                        };
-                        let b = match backend_result {
-                            Ok(backend) => backend,
-                            Err(e) => {
-                                error!("{e}");
-                                setup_running.store(false, Ordering::SeqCst);
-                                if setup_cancel_requested.load(Ordering::SeqCst) {
-                                    return;
-                                }
-                                if start_minimized {
-                                    let _ = reveal_window(&splash);
-                                }
-                                status_updater(SplashUpdate::error(
-                                    t!("dialog.startup_failed"),
-                                    t!("dialog.backend_launch_failed", error = e.to_string()),
-                                    last_progress.get().max(97),
-                                ));
-                                return;
-                            }
-                        };
-                        *backend.lock().unwrap() = Some(b);
-                        let notification_click: NotificationClickHandler = {
-                            let app_handle = app_handle.clone();
-                            let recreating_main_window = recreating_main_window_for_notify.clone();
-                            Arc::new(move || {
-                                restore_main_window_from_any_thread(
-                                    app_handle.clone(),
-                                    port,
-                                    recreating_main_window.clone(),
-                                );
-                            })
-                        };
-                        start_notify_stream(
-                            app_handle.clone(),
-                            port,
-                            allow_exit.clone(),
-                            notification_click,
-                        );
-                        start_launcher_control_stream(port, allow_exit.clone());
-                        status_updater(
-                            SplashUpdate::loading(t!("splash.opening"), t!("splash.ready"), 100)
-                                .with_subtitle(format!(
-                                    "{} | Tips:{}",
-                                    t!("splash.startup_complete"),
-                                    crate::setup::get_tip()
-                                )),
-                        );
-                        let _ = splash.destroy();
-                        debug!("Destroyed splash window after startup");
-
-                        info!("Webview is ready");
-                        let window = app_handle.get_webview_window("main").unwrap();
-                        window.set_resizable(true).unwrap();
-                        if let Err(e) = navigate_backend_or_error(&window, port) {
-                            error!("Failed to navigate main window: {:?}", e);
-                        }
-                        if start_minimized {
-                            info!("Backend is ready; keeping main window hidden in tray");
-                            let _ = window.hide();
-                        } else {
-                            reveal_window(&window).unwrap();
-                        }
-                        setup_completed.store(true, Ordering::SeqCst);
-                        setup_running.store(false, Ordering::SeqCst);
-                    });
-                }
-                tauri::RunEvent::ExitRequested { api, .. } => {
-                    if !setup_completed.load(Ordering::SeqCst)
-                        && !startup_cleanup_started.load(Ordering::SeqCst)
-                    {
-                        api.prevent_exit();
-                        begin_startup_cleanup(
-                            app_handle.clone(),
-                            allow_exit.clone(),
-                            setup_cancel_requested.clone(),
-                            setup_running.clone(),
-                            startup_cleanup_started.clone(),
-                        );
-                        return;
-                    }
-
-                    let should_allow = allow_exit.load(Ordering::SeqCst);
-                    debug!("ExitRequested event: allow_exit={}", should_allow);
-
-                    // Only exit if explicitly allowed (e.g., via tray menu Quit)
-                    if !should_allow {
-                        api.prevent_exit();
-                        debug!("Minimizing main window to tray");
-                        minimize_main_window_to_tray(&app_handle);
-                        return;
-                    }
-
-                    debug!("allow_exit is TRUE, proceeding with app shutdown");
-                    info!("App exit allowed, shutting down backend...");
-                    if let Some(ref mut b) = *backend.lock().unwrap() {
-                        if let Err(e) = b.terminate() {
-                            warn!("Failed to terminate backend process: {:?}", e);
-                        }
-                    }
-                }
-                #[cfg(target_os = "macos")]
-                tauri::RunEvent::Reopen { .. } => {
-                    restore_main_window_from_any_thread(
-                        app_handle.clone(),
-                        port,
-                        recreating_main_window_for_run.clone(),
-                    );
-                }
-                tauri::RunEvent::WindowEvent {
-                    label,
-                    event: tauri::WindowEvent::CloseRequested { ref api, .. },
-                    ..
-                } => {
-                    debug!("Window {} close requested", label);
-
-                    if label == "splash" && !setup_completed.load(Ordering::SeqCst) {
-                        api.prevent_close();
-                        begin_startup_cleanup(
-                            app_handle.clone(),
-                            allow_exit.clone(),
-                            setup_cancel_requested.clone(),
-                            setup_running.clone(),
-                            startup_cleanup_started.clone(),
-                        );
-                        return;
-                    }
-
-                    if label == "splash" && !allow_exit.load(Ordering::SeqCst) {
-                        api.prevent_close();
-                        allow_exit.store(true, Ordering::SeqCst);
-                        app_handle.exit(0);
-                        return;
-                    }
-
-                    // Windows: show the in-window close chooser instead of a native dialog.
-                    #[cfg(windows)]
-                    {
-                        if label == "main" && !allow_exit.load(Ordering::SeqCst) {
-                            api.prevent_close();
-                            if let Some(main_window) = app_handle.get_webview_window("main") {
-                                if let Err(err) = main_window.eval(
-                                    "if (typeof window.__ALAS_OPEN_CLOSE_PROMPT !== 'function') { throw new Error('close prompt is unavailable'); } window.__ALAS_OPEN_CLOSE_PROMPT();",
-                                ) {
-                                    warn!("Unable to open close chooser: {err:?}");
-                                    minimize_main_window_to_tray(&app_handle);
-                                }
-                            } else {
-                                minimize_main_window_to_tray(&app_handle);
-                            }
-                            return;
-                        }
-                    }
-
-                    // macOS: switch to Accessory policy so the app does not terminate
-                    // when no Regular windows are visible.
-                    #[cfg(target_os = "macos")]
-                    {
-                        if label == "main" && !allow_exit.load(Ordering::SeqCst) {
-                            api.prevent_close();
-                            minimize_main_window_to_tray(&app_handle);
-                            return;
-                        }
-                    }
-
-                    // Linux: just hide to tray
-                    #[cfg(target_os = "linux")]
-                    {
-                        if label == "main" && !allow_exit.load(Ordering::SeqCst) {
-                            api.prevent_close();
-                            minimize_main_window_to_tray(&app_handle);
-                            return;
-                        }
-                    }
-                }
-
-                _ => {}
-            };
-        });
-    Ok(())
+    launcher::run()
 }
 
 fn initialize_logging() -> Result<WorkerGuard> {
     let log_dir = Path::new("log");
     let log_filename = today_launcher_log_filename();
     truncate_log_file(log_dir, &log_filename)?;
+    // rolling::never 不做按时间/大小轮转，固定写当日文件（启动时已先截断）。
     let file_appender = tracing_appender::rolling::never(log_dir, log_filename);
     let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -2579,6 +348,11 @@ fn initialize_logging() -> Result<WorkerGuard> {
     Ok(guard)
 }
 
+/// 确保日志目录存在并把日志文件截断为空（File::create 语义）。
+/// 每次启动重新记录，避免单文件无限增长。
+///
+/// # Errors
+/// 目录创建或文件创建失败时返回 Err。
 fn truncate_log_file(log_dir: &Path, filename: &str) -> Result<()> {
     fs::create_dir_all(log_dir)?;
     let path = log_dir.join(filename);
@@ -2587,19 +361,26 @@ fn truncate_log_file(log_dir: &Path, filename: &str) -> Result<()> {
     Ok(())
 }
 
+/// Tauri 命令：由注入的 window.saveAs 调用（见 page_load_injector）。
+///
+/// 前端传入文件名与 base64 编码的文件内容，此处解码后弹出系统"另存为"
+/// 对话框并写盘。无返回值，失败仅记录日志。
 #[tauri::command]
 fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {
     match BASE64_STANDARD.decode(data) {
+        // 解码成功：弹出系统"另存为"对话框；写盘在回调中完成，失败只记日志。
         Ok(decoded_data) => app_handle
             .dialog()
             .file()
             .set_file_name(filename)
             .save_file(move |path| {
                 let result: Result<()> = (move || {
-                    let file_path = path
-                        .as_ref()
-                        .and_then(FilePath::as_path)
-                        .ok_or_else(|| anyhow!("Invalid file path {:?}", &path))?;
+                    let file_path = path.as_ref().and_then(FilePath::as_path).ok_or_else(|| {
+                        anyhow!(t!(
+                            "errors.invalid_file_path",
+                            path = format!("{:?}", &path)
+                        ))
+                    })?;
                     fs::write(file_path, &decoded_data)?;
                     info!("Saved file to {:?}", file_path);
                     Ok(())
@@ -2614,11 +395,15 @@ fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {
     }
 }
 
+/// Tauri 命令：把今天的 GUI 日志（log/{日期}_gui.txt）另存到用户选择的位置。
+/// 返回被保存的文件名；读取失败时返回错误字符串。
 #[tauri::command]
 fn download_today_gui_log(app_handle: tauri::AppHandle) -> std::result::Result<String, String> {
     download_log_file(app_handle, today_gui_log_filename(), "GUI")
 }
 
+/// Tauri 命令：把今天的启动器日志（log/{日期}_launcher.txt）另存到用户
+/// 选择的位置。返回被保存的文件名；读取失败时返回错误字符串。
 #[tauri::command]
 fn download_today_launcher_log(
     app_handle: tauri::AppHandle,
@@ -2626,6 +411,11 @@ fn download_today_launcher_log(
     download_log_file(app_handle, today_launcher_log_filename(), "launcher")
 }
 
+/// 读取指定日志文件并弹出另存为对话框。
+///
+/// # Errors
+/// 以 Err(String) 返回（前端直接展示）：获取工作目录或读取日志文件失败时
+/// 携带本地化错误文案；保存对话框是异步的，写盘失败只记日志。
 fn download_log_file(
     app_handle: tauri::AppHandle,
     filename: String,
@@ -2636,13 +426,14 @@ fn download_log_file(
         .map_err(|e| e.to_string())?
         .join("log")
         .join(&filename);
-    let data = fs::read(&source_path).map_err(|e| {
-        t!(
+    if !source_path.is_file() {
+        return Err(t!(
             "errors.read_log_file",
             path = source_path.to_string_lossy().to_string(),
-            error = e.to_string()
+            error = "file not found".to_string()
         )
-    })?;
+        .to_string());
+    }
 
     app_handle
         .dialog()
@@ -2650,12 +441,15 @@ fn download_log_file(
         .set_file_name(&filename)
         .save_file(move |path| {
             let log_name_for_save = log_name.clone();
+            let source_path_for_save = source_path.clone();
             let result: Result<()> = (move || {
-                let file_path = path
-                    .as_ref()
-                    .and_then(FilePath::as_path)
-                    .ok_or_else(|| anyhow!("Invalid file path {:?}", &path))?;
-                fs::write(file_path, &data)?;
+                let file_path = path.as_ref().and_then(FilePath::as_path).ok_or_else(|| {
+                    anyhow!(t!(
+                        "errors.invalid_file_path",
+                        path = format!("{:?}", &path)
+                    ))
+                })?;
+                fs::copy(&source_path_for_save, file_path)?;
                 info!("Saved {} log to {:?}", log_name_for_save, file_path);
                 Ok(())
             })();
@@ -2667,25 +461,165 @@ fn download_log_file(
     Ok(filename)
 }
 
+/// 生成今天的 GUI 日志文件名（{日期}_gui.txt，日期取本地时区）。
 fn today_gui_log_filename() -> String {
     format!("{}_gui.txt", Local::now().format("%Y-%m-%d"))
 }
 
+/// log 归档进度事件载荷：done/total 为已写入与总计字节数。
+#[derive(Clone, serde::Serialize)]
+struct LogArchiveProgress {
+    done: u64,
+    total: u64,
+}
+
+/// Tauri 命令：弹出 zip 另存为对话框（带过滤器与预填文件名），
+/// 返回用户选择的目标路径；取消时返回 None。
+///
+/// # Errors
+/// 对话框通道关闭时返回错误字符串。
+#[tauri::command]
+async fn prompt_log_archive_path(
+    app_handle: tauri::AppHandle,
+) -> std::result::Result<Option<String>, String> {
+    let archive_name = format!("AzurPilot-log-{}.zip", Local::now().format("%Y-%m-%d"));
+    let mut builder = app_handle.dialog().file();
+    builder = builder.add_filter("ZIP", &["zip"]);
+    builder = builder.set_file_name(&archive_name);
+    // 默认定位到系统"下载"文件夹；获取失败时交给系统记忆的位置。
+    if let Some(downloads) = dirs::download_dir() {
+        builder = builder.set_directory(downloads);
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    builder.save_file(move |path| {
+        let _ = sender.send(path.map(|p| p.to_string()));
+    });
+    tauri::async_runtime::spawn_blocking(move || receiver.recv())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Tauri 命令：把 log 目录顶层文件打包为 zip 写入 target 路径。
+/// 打包在后台线程执行，逐文件向 launcher 窗口发进度事件
+/// （launcher://log-archive-progress，done/total 字节）。返回文件数。
+///
+/// # Errors
+/// 日志目录缺失、目录扫描或 zip 写入失败时返回本地化错误字符串。
+#[tauri::command]
+async fn download_log_archive(
+    app_handle: tauri::AppHandle,
+    target: String,
+) -> std::result::Result<usize, String> {
+    let log_dir = std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join("log");
+    if !log_dir.is_dir() {
+        return Err(t!(
+            "errors.log_dir_missing",
+            path = log_dir.to_string_lossy().to_string()
+        )
+        .to_string());
+    }
+    let mut files: Vec<(std::path::PathBuf, String, u64)> = Vec::new();
+    for entry in std::fs::read_dir(&log_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let size = entry.metadata().map_err(|e| e.to_string())?.len();
+        files.push((path, entry.file_name().to_string_lossy().to_string(), size));
+    }
+    if files.is_empty() {
+        return Err(t!(
+            "errors.log_dir_missing",
+            path = log_dir.to_string_lossy().to_string()
+        )
+        .to_string());
+    }
+    let total: u64 = files.iter().map(|(_, _, size)| *size).sum();
+    let emitter = app_handle;
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = fs::File::create(&target).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let mut done: u64 = 0;
+        for (path, name, size) in &files {
+            zip.start_file(name.clone(), options.clone())
+                .map_err(|e| e.to_string())?;
+            let mut source = fs::File::open(path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut source, &mut zip).map_err(|e| e.to_string())?;
+            done += size;
+            let _ = emitter.emit_to(
+                "launcher",
+                "launcher://log-archive-progress",
+                LogArchiveProgress { done, total },
+            );
+        }
+        zip.finish().map_err(|e| e.to_string())?;
+        if let Err(e) = reveal_in_file_manager(std::path::Path::new(&target)) {
+            warn!("Failed to reveal log archive: {:?}", e);
+        }
+        Ok(files.len())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 在系统文件管理器中定位指定文件（Windows 资源管理器选中、macOS 访达
+/// 显示、Linux 打开所在目录）。失败仅由调用方记录，不影响保存结果。
+fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        // explorer /select 需要反斜杠路径；"/select," 与路径作为一个参数传入。
+        Command::new("explorer")
+            .arg(format!(
+                "/select,{}",
+                path.to_string_lossy().replace('/', "\\")
+            ))
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        Command::new("open")
+            .args(["-R", &path.to_string_lossy()])
+            .spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::process::Command;
+        if let Some(parent) = path.parent() {
+            Command::new("xdg-open").arg(parent).spawn()?;
+        }
+    }
+    Ok(())
+}
+
+/// 生成今天的启动器日志文件名（{日期}_launcher.txt，日期取本地时区）。
 fn today_launcher_log_filename() -> String {
     format!("{}_launcher.txt", Local::now().format("%Y-%m-%d"))
 }
 
+/// Tauri 命令：隐藏主窗口并最小化到托盘（自定义标题栏的"托盘化"按钮与
+/// 关闭选择菜单的"最小化到托盘"选项均调用此命令）。
 #[tauri::command]
 fn window_hide(app_handle: tauri::AppHandle) -> tauri::Result<()> {
     minimize_main_window_to_tray(&app_handle);
     Ok(())
 }
 
+/// Tauri 命令：最小化窗口到任务栏（splash 与标题栏的最小化按钮调用）。
 #[tauri::command]
 fn window_minimize(window: WebviewWindow) -> tauri::Result<()> {
-    window.minimize()
+    minimize_window(&window)
 }
 
+/// Tauri 命令：切换窗口最大化/还原状态。
+/// 返回切换后是否处于最大化，供标题栏按钮同步图标。
 #[tauri::command]
 fn window_toggle_maximize(window: WebviewWindow) -> tauri::Result<bool> {
     if window.is_maximized()? {
@@ -2697,42 +631,73 @@ fn window_toggle_maximize(window: WebviewWindow) -> tauri::Result<bool> {
     }
 }
 
+/// Tauri 命令：关闭窗口（splash 的关闭按钮调用；主窗口的关闭行为由
+/// RunEvent::WindowEvent 的 CloseRequested 分支按平台处理）。
 #[tauri::command]
 fn window_close(window: WebviewWindow) -> tauri::Result<()> {
     window.close()
 }
 
+/// Tauri 命令：用户在关闭选择菜单确认退出时调用——置位放行标志并以
+/// 退出码 0 结束应用，使 ExitRequested 分支放行真正的关停（含终止后端）。
 #[tauri::command]
-fn window_exit_application(
-    app_handle: tauri::AppHandle,
-    exit_control: State<'_, ExitControl>,
-) -> tauri::Result<()> {
-    exit_control.0.store(true, Ordering::SeqCst);
-    app_handle.exit(0);
-    Ok(())
+fn window_exit_application(app_handle: tauri::AppHandle) -> Result<(), String> {
+    app_handle
+        .state::<Arc<launcher::Launcher>>()
+        .exit()
+        .map_err(|e| e.to_string())
 }
 
+/// Tauri 命令：按 CSS 像素内容尺寸调整当前窗口大小（崩溃报告窗自适应高度）。
+///
+/// 前端测量内容区实际高度后传入逻辑像素尺寸，这里按窗口 DPI 换算为物理像素，
+/// 使无边框弹窗高度精确贴合内容，而不是固定一个大尺寸留下空白。
+#[tauri::command]
+fn window_fit_content(window: WebviewWindow, width: u32, height: u32) -> tauri::Result<()> {
+    use tauri::LogicalSize;
+    // LogicalSize 由 Tauri 按窗口当前 DPI 自动换算为物理像素。
+    window.set_size(LogicalSize::new(width, height))
+}
+
+/// Tauri 命令：开始拖动窗口（标题栏拖拽区与 splash 拖拽区调用）。
 #[tauri::command]
 fn window_start_dragging(window: WebviewWindow) -> tauri::Result<()> {
     window.start_dragging()
 }
 
+/// Tauri 命令：查询窗口当前是否处于最大化（标题栏按钮同步图标用）。
 #[tauri::command]
 fn window_is_maximized(window: WebviewWindow) -> tauri::Result<bool> {
     window.is_maximized()
 }
 
+/// Tauri 命令：错误页面的"重试连接"按钮（含每秒自动重试）调用。
+///
+/// 在阻塞线程中等待后端端口恢复可达，随后换发免密令牌并导航过去；
+/// 超时未恢复返回 Ok(false)（前端提示"仍然失败"），恢复并成功导航返回
+/// Ok(true)。
+///
+/// # Errors
+/// 以 Err(String) 返回：阻塞任务失败、URL 解析或导航失败时携带错误信息。
 #[tauri::command]
 async fn retry_backend_connection(
     window: WebviewWindow,
-    port: u16,
+    controller: State<'_, Arc<launcher::Launcher>>,
 ) -> std::result::Result<bool, String> {
+    // main 与独立连接弹窗窗口均可发起重试；capabilities 已限定本地窗口。
+    if window.label() != "main" && window.label() != "connection" {
+        warn!("Rejected backend retry from window '{}'", window.label());
+        return Err(t!("launcher.forbidden").to_string());
+    }
+    let port = controller.port();
+    let task = controller.snapshot().task_id;
     // 等待与换发免密令牌均含阻塞调用，统一放在阻塞线程中执行。
+    let navigation_controller = controller.inner().clone();
     let target_url = tauri::async_runtime::spawn_blocking(move || {
         if wait_for_backend_connection(port, BACKEND_NAVIGATION_TIMEOUT).is_err() {
             return None;
         }
-        Some(webui_navigate_url(port))
+        Some(navigation_controller.webui_url())
     })
     .await
     .map_err(|e| {
@@ -2744,23 +709,43 @@ async fn retry_backend_connection(
         return Ok(false);
     };
 
+    if controller.snapshot().task_id != task || !controller.snapshot().backend_running {
+        return Ok(false);
+    }
     let url = Url::parse(&target_url).map_err(|e| e.to_string())?;
-    window.navigate(url).map_err(|e| {
+    // 无论由哪个窗口发起，导航回 WebUI 的都是 main 窗口。
+    let target = if window.label() == "main" {
+        Some(window.clone())
+    } else {
+        window.app_handle().get_webview_window("main")
+    };
+    let Some(target) = target else {
+        return Ok(false);
+    };
+    target.navigate(url).map_err(|e| {
         error!("Failed to navigate to reconnected backend: {e:?}");
         e.to_string()
     })?;
+    // 后端已恢复：连接错误独立弹窗随之关闭（弹窗窗口自身调用时亦然）。
+    crate::native_dialog::close_connection_dialog(window.app_handle());
     Ok(true)
 }
 
+/// 页面加载完成回调：向主窗口页面注入启动器辅助 JS。
+///
+/// 注入内容（一个幂等的 IIFE）：阻止浏览器历史后退；把 window.saveAs
+/// 覆盖为"经 FileReader 转 base64 后调用 Tauri save_as 命令"的版本；并
+/// 拼入自定义标题栏脚本（macOS 除外，见 main_window_titlebar_injection_script）。
 fn page_load_injector(webview: WebviewWindow, payload: PageLoadPayload<'_>) {
+    // 只在加载完成（Finished）时注入：开始加载阶段文档尚未就绪，注入无效。
     if payload.event() == PageLoadEvent::Finished {
         info!(
             "Injecting saveFile function to loaded page: {}",
             redacted_url_log(payload.url())
         );
         let injected_js = r#"
-if (!window.alas_launcher_injected) {
-    window.alas_launcher_injected = true;
+if (!window.azurpilot_launcher_injected) {
+    window.azurpilot_launcher_injected = true;
     (function () {
         // Prevent going back
         history.pushState(null, document.title, location.href);
@@ -2782,66 +767,18 @@ if (!window.alas_launcher_injected) {
             };
             reader.readAsDataURL(blob);
         };
-__ALAS_TITLEBAR_SCRIPT__
+__AZURPILOT_TITLEBAR_SCRIPT__
     })();
 }
 "#
         .replace(
-            "__ALAS_TITLEBAR_SCRIPT__",
+            "__AZURPILOT_TITLEBAR_SCRIPT__",
             &main_window_titlebar_injection_script(),
         );
+        // 注入失败不影响页面本身功能，仅记录日志。
         if let Err(e) = webview.eval(&injected_js) {
             error!("Failed to inject JS to webview: {:?}", e);
         }
-    }
-}
-
-fn initialize_splash(splash: &WebviewWindow, show_window: bool) {
-    match Url::parse(SPLASH_URL) {
-        Ok(url) => {
-            if let Err(e) = splash.navigate(url) {
-                error!("Failed to navigate splash page: {:?}", e);
-            }
-            if !wait_for_splash_ready(splash, Duration::from_secs(2)) {
-                warn!("Timed out waiting for splash page readiness; showing splash anyway");
-            }
-            if show_window {
-                if let Err(e) = splash.show() {
-                    error!("Failed to show splash window: {:?}", e);
-                }
-            }
-        }
-        Err(e) => {
-            error!("Failed to parse splash URL: {:?}", e);
-        }
-    }
-}
-
-fn wait_for_splash_ready(splash: &WebviewWindow, timeout: Duration) -> bool {
-    let started_at = Instant::now();
-    while started_at.elapsed() < timeout {
-        if splash
-            .eval(
-                r#"
-                if (!window.__ALAS_SPLASH_READY) {
-                    throw new Error("splash page is not ready");
-                }
-                "#,
-            )
-            .is_ok()
-        {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    false
-}
-
-fn update_splash(splash: &WebviewWindow, update: &SplashUpdate) {
-    let payload = to_string(update).unwrap();
-    let script = format!("window.__ALAS_SPLASH_UPDATE && window.__ALAS_SPLASH_UPDATE({payload});");
-    if let Err(e) = splash.eval(&script) {
-        error!("Failed to update splash page: {:?}", e);
     }
 }
 
@@ -2849,1630 +786,46 @@ fn backend_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/")
 }
 
-fn splash_response() -> tauri::http::Response<Vec<u8>> {
-    let video_bg_b64 = BASE64_STANDARD.encode(SPLASH_BG_VIDEO);
-    let mi_sans_font_b64 = BASE64_STANDARD.encode(MI_SANS_FONT);
-    tauri::http::Response::builder()
-        .header(
-            tauri::http::header::CONTENT_TYPE,
-            "text/html; charset=utf-8",
-        )
-        .body(splash_redesigned_shell_html(&video_bg_b64, &mi_sans_font_b64).into_bytes())
-        .unwrap()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::Builder as TempDirBuilder;
 
-fn check_backend_connection(port: u16) -> Result<()> {
-    let address: SocketAddr = format!("127.0.0.1:{port}").parse()?;
-    TcpStream::connect_timeout(&address, BACKEND_CONNECT_TIMEOUT)
-        .map(|_| ())
-        .map_err(|e| anyhow!("Unable to connect to local backend at {address}: {e}"))
-}
-
-fn wait_for_backend_connection(port: u16, timeout: Duration) -> Result<()> {
-    let started_at = Instant::now();
-    let mut last_error = None;
-    while started_at.elapsed() < timeout {
-        match check_backend_connection(port) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_error = Some(e);
-                thread::sleep(Duration::from_millis(200));
-            }
-        }
+    /// 时间炸弹段 enabled 时应能解析出配置（且与 enabled 值一致）。
+    #[test]
+    fn test_time_bomb_config_parses_when_enabled() {
+        let section =
+            cargo_toml_section("package.metadata.azurpilot.time-bomb").expect("section exists");
+        let enabled = cargo_toml_value(section, "enabled").as_deref() == Some("true");
+        let config = time_bomb_config().expect("time bomb config parses");
+        assert_eq!(config.is_some(), enabled);
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!(t!("errors.backend_timeout"))))
-}
-
-fn navigate_backend_or_error(window: &WebviewWindow, port: u16) -> Result<bool> {
-    match wait_for_backend_connection(port, BACKEND_NAVIGATION_TIMEOUT) {
-        Ok(()) => {
-            let url = webui_navigate_url(port);
-            window.navigate(Url::parse(&url)?)?;
-            Ok(true)
-        }
-        Err(e) => {
-            warn!("Backend connection check failed before navigation: {:?}", e);
-            navigate_to_backend_error(window, port, &e.to_string())?;
-            Ok(false)
-        }
-    }
-}
-
-fn navigate_to_backend_error(window: &WebviewWindow, port: u16, error_detail: &str) -> Result<()> {
-    let url = backend_error_url(port, error_detail)?;
-    window.navigate(url)?;
-    Ok(())
-}
-
-fn backend_error_url(port: u16, error_detail: &str) -> Result<Url> {
-    let port = port.to_string();
-    Ok(Url::parse_with_params(
-        BACKEND_ERROR_URL_BASE,
-        [("port", port.as_str()), ("detail", error_detail)],
-    )?)
-}
-
-fn backend_error_response(
-    request: tauri::http::Request<Vec<u8>>,
-) -> tauri::http::Response<Vec<u8>> {
-    let (port, detail) = backend_error_request_params(request.uri().to_string().as_str());
-    let html = backend_error_html(port, &detail);
-
-    tauri::http::Response::builder()
-        .header(
-            tauri::http::header::CONTENT_TYPE,
-            "text/html; charset=utf-8",
-        )
-        .body(html.into_bytes())
-        .unwrap()
-}
-
-fn backend_error_request_params(uri: &str) -> (u16, String) {
-    let mut port = 22267;
-    let mut detail = t!("error_page.unable_connect").to_string();
-
-    if let Ok(url) = Url::parse(uri) {
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "port" => {
-                    if let Ok(parsed_port) = value.parse::<u16>() {
-                        port = parsed_port;
-                    }
-                }
-                "detail" => detail = value.into_owned(),
-                _ => {}
-            }
-        }
+    /// cargo_toml_value 应能读到 expires-at 与中文 message 字段。
+    #[test]
+    fn test_cargo_toml_value_reads_time_bomb_fields() {
+        let section =
+            cargo_toml_section("package.metadata.azurpilot.time-bomb").expect("section exists");
+        assert!(cargo_toml_value(section, "expires-at").is_some());
+        assert_eq!(
+            Some("测试已结束，请安装正式版".to_owned()),
+            cargo_toml_value(section, "message")
+        );
     }
 
-    (port, detail)
-}
+    /// 截断日志文件应把已存在的旧内容清空。
+    #[test]
+    fn test_truncate_log_file_replaces_existing_contents() {
+        let temp_dir = TempDirBuilder::new()
+            .prefix("launcher-log-truncate-test-")
+            .tempdir()
+            .expect("create temporary log directory");
+        let filename = "launcher.txt";
+        let path = temp_dir.path().join(filename);
+        fs::write(&path, "old launcher log").expect("write old log");
 
-fn handle_backend_navigation(app: tauri::AppHandle, port: u16, url: &Url) -> bool {
-    if !is_backend_url(url, port) {
-        return true;
-    }
+        truncate_log_file(temp_dir.path(), filename).expect("truncate launcher log");
 
-    match check_backend_connection(port) {
-        Ok(()) => true,
-        Err(e) => {
-            let blocked_url = redacted_url_log(url);
-            warn!(
-                "Blocked navigation to unreachable backend {}: {:?}",
-                blocked_url, e
-            );
-            let error_detail = e.to_string();
-            thread::spawn(move || {
-                if let Some(window) = app.get_webview_window("main") {
-                    if let Err(e) = navigate_to_backend_error(&window, port, &error_detail) {
-                        error!("Failed to show backend error page: {:?}", e);
-                    }
-                }
-            });
-            false
-        }
-    }
-}
-
-fn is_backend_url(url: &Url, port: u16) -> bool {
-    matches!(url.scheme(), "http" | "https")
-        && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"))
-        && url.port_or_known_default() == Some(port)
-}
-
-fn escape_html(input: impl AsRef<str>) -> String {
-    input
-        .as_ref()
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn backend_error_html(port: u16, error_detail: &str) -> String {
-    let backend_url_json = to_string(&backend_url(port)).unwrap();
-    let error_detail_json = to_string(error_detail).unwrap();
-    let mi_sans_font_b64 = BASE64_STANDARD.encode(MI_SANS_FONT);
-    let splash_video_b64 = BASE64_STANDARD.encode(SPLASH_BG_VIDEO);
-    let titlebar_script = main_window_titlebar_injection_script();
-    let i18n = serde_json::json!({
-        "title": t!("error_page.title"),
-        "heading": t!("error_page.heading"),
-        "description": t!("error_page.description"),
-        "address": t!("error_page.address"),
-        "errorLabel": t!("error_page.error_label"),
-        "retry": t!("error_page.retry"),
-        "downloadGuiLog": t!("error_page.download_gui_log"),
-        "downloadLauncherLog": t!("error_page.download_launcher_log"),
-        "reconnecting": t!("error_page.reconnecting"),
-        "stillFailed": t!("error_page.still_failed"),
-        "retryFailed": t!("error_page.retry_failed"),
-        "preparing": t!("error_page.preparing"),
-        "saved": t!("error_page.saved"),
-        "downloadFailed": t!("error_page.download_failed"),
-    });
-    let i18n_json = to_string(&i18n).unwrap();
-
-    format!(
-        r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-  @font-face {{
-    font-family: "MiSans";
-    src: url(data:font/ttf;base64,{mi_sans_font_b64}) format("truetype");
-    font-weight: 100 900;
-    font-style: normal;
-    font-display: swap;
-  }}
-  :root {{
-    color-scheme: light;
-    --bg: #f4f6f8;
-    --surface: #ffffff;
-    --surface-soft: #f8fafb;
-    --line: #e5e9ee;
-    --text: #17212b;
-    --muted: #687582;
-    --accent: #176b67;
-    --accent-hover: #105854;
-    --accent-soft: #e8f4f2;
-    --danger: #b64545;
-    --danger-soft: #fff1f0;
-  }}
-  * {{
-    box-sizing: border-box;
-  }}
-  html, body {{
-    width: 100%;
-    min-height: 100%;
-    margin: 0;
-    font-family: "MiSans", sans-serif;
-    font-weight: 420;
-    font-synthesis: none;
-    color: var(--text);
-    background: #dfe7ea;
-  }}
-  body {{
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 72px 44px 44px;
-    position: relative;
-    isolation: isolate;
-    overflow: hidden;
-    background: transparent;
-    animation: page-in 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  }}
-  .error-background-video {{
-    position: fixed;
-    inset: 0;
-    z-index: 0;
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    opacity: 0.9;
-    pointer-events: none;
-  }}
-  .error-background-scrim {{
-    position: fixed;
-    inset: 0;
-    z-index: 1;
-    background: rgba(244, 247, 248, 0.36);
-    pointer-events: none;
-  }}
-  .panel {{
-    position: relative;
-    z-index: 2;
-    display: grid;
-    grid-template-columns: 190px minmax(0, 1fr);
-    width: min(820px, 100%);
-    min-height: 390px;
-    overflow: hidden;
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    background: rgba(255, 255, 255, 0.76);
-    backdrop-filter: blur(22px) saturate(1.08);
-    box-shadow: 0 20px 48px rgba(23, 33, 43, 0.11), 0 2px 6px rgba(23, 33, 43, 0.04);
-    animation: panel-in 520ms cubic-bezier(0.22, 1, 0.36, 1) 70ms both;
-  }}
-  .signal {{
-    position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: var(--accent);
-    color: #fff;
-  }}
-  .signal::before, .signal::after {{
-    content: "";
-    position: absolute;
-    border: 1px solid rgba(255, 255, 255, 0.17);
-    border-radius: 50%;
-    opacity: 0;
-    animation: signal-expand 3.2s ease-out infinite;
-  }}
-  .signal::before {{ width: 76px; height: 76px; }}
-  .signal::after {{ width: 76px; height: 76px; animation-delay: 1.6s; }}
-  .signal-core {{
-    position: relative;
-    z-index: 1;
-    width: 76px;
-    height: 76px;
-    display: grid;
-    place-items: center;
-    border: 1px solid rgba(255, 255, 255, 0.45);
-    border-radius: 50%;
-    background: rgba(255, 255, 255, 0.12);
-    animation: core-breathe 2.8s ease-in-out infinite;
-  }}
-  .signal-core svg {{
-    width: 36px;
-    height: 36px;
-    fill: none;
-    stroke: currentColor;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    stroke-width: 1.7;
-  }}
-  .content {{
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-    padding: 38px 42px 32px;
-    animation: content-in 500ms cubic-bezier(0.22, 1, 0.36, 1) 140ms both;
-  }}
-  .eyebrow {{
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: var(--muted);
-    font-size: 11px;
-    font-weight: 620;
-    letter-spacing: 1.2px;
-    text-transform: uppercase;
-  }}
-  .eyebrow::before {{
-    content: "";
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--danger);
-    box-shadow: 0 0 0 4px var(--danger-soft);
-    animation: status-pulse 2s ease-in-out infinite;
-  }}
-  h1 {{
-    max-width: 470px;
-    margin: 16px 0 0;
-    font-size: 30px;
-    font-weight: 680;
-    letter-spacing: -0.3px;
-    line-height: 1.18;
-  }}
-  .lead {{
-    max-width: 510px;
-    margin: 12px 0 0;
-    color: var(--muted);
-    font-size: 14px;
-    font-weight: 430;
-    line-height: 1.65;
-  }}
-  .details {{
-    margin: 24px 0 0;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    overflow: hidden;
-    background: var(--surface-soft);
-  }}
-  .row {{
-    display: grid;
-    grid-template-columns: 70px minmax(0, 1fr);
-    gap: 14px;
-    padding: 10px 13px;
-    border-top: 1px solid var(--line);
-    font-size: 12px;
-    font-weight: 460;
-    line-height: 1.5;
-  }}
-  .row:first-child {{ border-top: 0; }}
-  .label {{ color: var(--muted); }}
-  .value {{
-    min-width: 0;
-    overflow-wrap: anywhere;
-    color: var(--text);
-    font-family: inherit;
-    font-weight: 500;
-    font-variant-numeric: tabular-nums;
-  }}
-  .actions {{
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    flex-wrap: wrap;
-    margin-top: auto;
-    padding-top: 24px;
-  }}
-  button {{
-    min-height: 36px;
-    border: 1px solid transparent;
-    border-radius: 7px;
-    padding: 0 13px;
-    font: inherit;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
-    will-change: transform;
-  }}
-  button:hover {{ transform: translateY(-1px); }}
-  button:active {{ transform: translateY(0); }}
-  .action-button {{
-    color: #fff;
-    background: var(--accent);
-  }}
-  .action-button:hover {{ background: var(--accent-hover); }}
-  .secondary-button {{
-    color: var(--accent);
-    border-color: #c5dfdc;
-    background: var(--accent-soft);
-  }}
-  .secondary-button:hover {{ background: #dcefeb; border-color: #a8d2cd; }}
-  button:disabled {{ cursor: default; opacity: 0.55; }}
-  button:disabled:hover {{ transform: none; }}
-  .status {{
-    flex: 1 1 100%;
-    min-height: 18px;
-    color: var(--muted);
-    font-size: 12px;
-    font-weight: 460;
-  }}
-  .footer {{
-    margin-top: 16px;
-    color: #9aa5ae;
-    font-size: 11px;
-    font-weight: 430;
-  }}
-  @media (max-width: 680px) {{
-    body {{ padding: 62px 18px 24px; align-items: flex-start; }}
-    .panel {{ grid-template-columns: 1fr; min-height: 0; }}
-    .signal {{ min-height: 120px; }}
-    .signal::before {{ width: 76px; height: 76px; }}
-    .signal::after {{ width: 76px; height: 76px; }}
-    .content {{ padding: 28px 24px 24px; }}
-    h1 {{ font-size: 25px; }}
-    .actions {{ margin-top: 22px; }}
-    button {{ flex: 1 1 auto; }}
-  }}
-  @media (max-width: 420px) {{
-    .row {{ grid-template-columns: 1fr; gap: 3px; }}
-    button {{ width: 100%; }}
-  }}
-  @keyframes page-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
-  @keyframes panel-in {{ from {{ opacity: 0; transform: translateY(12px) scale(0.985); }} to {{ opacity: 1; transform: translateY(0) scale(1); }} }}
-  @keyframes content-in {{ from {{ opacity: 0; transform: translateX(10px); }} to {{ opacity: 1; transform: translateX(0); }} }}
-  @keyframes signal-expand {{ 0% {{ opacity: 0.72; transform: scale(0.72); }} 68% {{ opacity: 0.12; }} 100% {{ opacity: 0; transform: scale(2.8); }} }}
-  @keyframes core-breathe {{ 0%, 100% {{ transform: scale(1); }} 50% {{ transform: scale(1.045); }} }}
-  @keyframes status-pulse {{ 0%, 100% {{ opacity: 0.62; }} 50% {{ opacity: 1; }} }}
-  @media (prefers-reduced-motion: reduce) {{
-    *, *::before, *::after {{ animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }}
-  }}
-</style>
-</head>
-<body>
-  <video class="error-background-video" autoplay muted loop playsinline preload="auto" aria-hidden="true">
-    <source src="data:video/mp4;base64,{splash_video_b64}" type="video/mp4">
-  </video>
-  <div class="error-background-scrim" aria-hidden="true"></div>
-  <main class="panel">
-    <div class="signal" aria-hidden="true">
-      <div class="signal-core">
-        <svg viewBox="0 0 24 24"><path d="M12 8v4m0 4h.01"/><path d="M10.3 3.9 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
-      </div>
-    </div>
-    <div class="content">
-      <div class="eyebrow">{error_label}</div>
-      <h1>{heading}</h1>
-      <p class="lead">{description}</p>
-      <section class="details" aria-label="{connection_info}">
-        <div class="row">
-          <div class="label">{address}</div>
-          <div id="backend-url" class="value"></div>
-        </div>
-        <div class="row">
-          <div class="label">{error_label}</div>
-          <div id="error-detail" class="value"></div>
-        </div>
-      </section>
-      <div class="actions">
-        <button id="retry-button" class="action-button" type="button">{retry}</button>
-        <button id="gui-log-button" class="secondary-button" type="button">{download_gui_log}</button>
-        <button id="launcher-log-button" class="secondary-button" type="button">{download_launcher_log}</button>
-        <span id="retry-status" class="status"></span>
-      </div>
-      <div class="footer">AzurPilot · {connection_info}</div>
-    </div>
-  </main>
-  <script>
-    (function () {{
-{titlebar_script}
-    }})();
-
-    const i18n = {i18n_json};
-    const backendUrl = {backend_url_json};
-    const errorDetail = {error_detail_json};
-    const port = {port};
-    const retryButton = document.getElementById('retry-button');
-    const guiLogButton = document.getElementById('gui-log-button');
-    const launcherLogButton = document.getElementById('launcher-log-button');
-    const retryStatus = document.getElementById('retry-status');
-    const invoke =
-      (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
-      || (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke);
-
-    document.getElementById('backend-url').textContent = backendUrl;
-    document.getElementById('error-detail').textContent = errorDetail;
-
-    retryButton.addEventListener('click', async () => {{
-      retryButton.disabled = true;
-      retryStatus.textContent = i18n.reconnecting;
-      try {{
-        if (typeof invoke !== 'function') {{
-          throw new Error('Tauri invoke is unavailable');
-        }}
-        const connected = await invoke('retry_backend_connection', {{ port }});
-        if (!connected) {{
-          retryStatus.textContent = i18n.stillFailed;
-          retryButton.disabled = false;
-        }}
-      }} catch (error) {{
-        retryStatus.textContent = i18n.retryFailed + (error && error.message ? error.message : error);
-        retryButton.disabled = false;
-      }}
-    }});
-
-    async function downloadLog(button, command, label) {{
-      button.disabled = true;
-      retryStatus.textContent = i18n.preparing.replace('%{{label}}', label);
-      try {{
-        if (typeof invoke !== 'function') {{
-          throw new Error('Tauri invoke is unavailable');
-        }}
-        const filename = await invoke(command);
-        retryStatus.textContent = i18n.saved.replace('%{{filename}}', filename);
-      }} catch (error) {{
-        retryStatus.textContent = i18n.downloadFailed.replace('%{{label}}', label) + (error && error.message ? error.message : error);
-      }} finally {{
-        button.disabled = false;
-      }}
-    }}
-
-    guiLogButton.addEventListener('click', () => {{
-      downloadLog(guiLogButton, 'download_today_gui_log', '{gui_log_label}');
-    }});
-
-    launcherLogButton.addEventListener('click', () => {{
-      downloadLog(launcherLogButton, 'download_today_launcher_log', '{launcher_log_label}');
-    }});
-
-    // 每秒尝试自动刷新（重试连接）
-    setInterval(() => {{
-      if (!retryButton.disabled) {{
-        retryButton.click();
-      }}
-    }}, 1000);
-  </script>
-</body>
-</html>"#,
-        title = t!("error_page.title"),
-        heading = t!("error_page.heading"),
-        description = t!("error_page.description"),
-        address = t!("error_page.address"),
-        error_label = t!("error_page.error_label"),
-        retry = t!("error_page.retry"),
-        download_gui_log = t!("error_page.download_gui_log"),
-        download_launcher_log = t!("error_page.download_launcher_log"),
-        gui_log_label = t!("error_page.download_gui_log"),
-        launcher_log_label = t!("error_page.download_launcher_log"),
-        connection_info = t!("error_page.connection_info"),
-    )
-}
-
-fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> String {
-    let i18n = serde_json::json!({
-        "defaultTip": t!("tips.17"),
-        "loading": t!("splash.loading_badge"),
-        "webuiInit": t!("splash.webui_init"),
-        "starting": t!("splash.starting"),
-        "errorBadge": t!("splash.error_badge"),
-        "initStopped": t!("splash.init_stopped"),
-        "progressMetaReady": t!("splash.progress_meta_ready"),
-        "preparingLog": t!("splash.preparing_log"),
-        "logSavedPrefix": t!("splash.log_saved_prefix"),
-        "logFailed": t!("splash.log_failed"),
-    });
-    let i18n_json = to_string(&i18n).unwrap();
-
-    r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  @font-face {
-    font-family: "MiSans";
-    src: url(data:font/ttf;base64,$MI_SANS_FONT) format("truetype");
-    font-weight: 100 900;
-    font-style: normal;
-    font-display: swap;
-  }
-  :root {
-    --primary-color: #4facfe;
-    --secondary-color: #00f2fe;
-    --text-main: #ffffff;
-    --text-sub: rgba(255, 255, 255, 0.76);
-    --text-muted: rgba(255, 255, 255, 0.52);
-    --surface-soft: rgba(255, 255, 255, 0.16);
-    --surface-border: rgba(255, 255, 255, 0.15);
-    --danger: #ff5f57;
-    --warning: #ffbd2e;
-  }
-  * {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-    user-select: none;
-  }
-  html,
-  body {
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-    background: #111827;
-  }
-  body {
-    font-family: "MiSans", sans-serif;
-    font-weight: 420;
-    font-synthesis: none;
-    color: var(--text-main);
-  }
-  button {
-    font: inherit;
-  }
-  .launcher-window {
-    position: relative;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-    border-radius: 0;
-    background: #111827;
-    box-shadow: none;
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-  }
-  .splash-background-video {
-    position: absolute;
-    inset: 0;
-    z-index: 0;
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    pointer-events: none;
-  }
-  .launcher-window::before {
-    content: "";
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    background:
-      linear-gradient(to bottom, rgba(0, 0, 0, 0.05) 0%, rgba(0, 0, 0, 0.03) 42%, rgba(0, 0, 0, 0.28) 100%),
-      linear-gradient(115deg, rgba(12, 30, 72, 0.10), rgba(255, 126, 117, 0.05));
-    pointer-events: none;
-  }
-  .top-bar {
-    position: relative;
-    z-index: 2;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    min-height: 56px;
-    padding: 10px 18px;
-    touch-action: none;
-    app-region: drag;
-    -webkit-app-region: drag;
-  }
-  .brand-zone {
-    display: flex;
-    align-items: center;
-    min-width: 0;
-    gap: 10px;
-  }
-  .app-title {
-    color: var(--text-main);
-    font-size: 18px;
-    font-weight: 610;
-    letter-spacing: 0;
-    text-shadow: 0 2px 6px rgba(0, 0, 0, 0.22);
-  }
-  .app-version {
-    color: var(--text-sub);
-    font-size: 12px;
-    font-weight: 460;
-    line-height: 1;
-    background: rgba(255, 255, 255, 0.14);
-    border: 1px solid rgba(255, 255, 255, 0.11);
-    padding: 4px 9px;
-    border-radius: 999px;
-    backdrop-filter: blur(8px);
-  }
-  .top-right {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-  }
-  .status-badge {
-    max-width: 260px;
-    min-height: 32px;
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    border-radius: 999px;
-    padding: 6px 13px;
-    color: #394451;
-    background: rgba(250, 250, 247, 0.78);
-    border: 1px solid rgba(255, 255, 255, 0.92);
-    backdrop-filter: blur(16px) saturate(1.2);
-    box-shadow: 0 4px 14px rgba(61, 79, 97, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.36);
-    font-size: 12px;
-    font-weight: 460;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .status-badge::before {
-    content: "";
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--secondary-color);
-    box-shadow: 0 0 12px rgba(0, 242, 254, 0.7);
-    flex: 0 0 auto;
-  }
-  .window-controls {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-    min-height: 36px;
-    padding: 3px 4px;
-    border: 1px solid rgba(255, 255, 255, 0.92);
-    border-radius: 18px;
-    background: rgba(250, 250, 247, 0.78);
-    box-shadow: 0 4px 14px rgba(61, 79, 97, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.36);
-    backdrop-filter: blur(16px) saturate(1.2);
-    flex: 0 0 auto;
-    app-region: no-drag;
-    -webkit-app-region: no-drag;
-  }
-  .window-controls * {
-    app-region: no-drag;
-    -webkit-app-region: no-drag;
-  }
-  .win-btn {
-    width: 28px;
-    height: 28px;
-    border: 0;
-    border-radius: 12px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    padding: 0;
-    color: #727b86;
-    background: transparent;
-    transition: transform 140ms cubic-bezier(.23, 1, .32, 1), background-color 140ms ease, color 140ms ease;
-  }
-  .win-btn:hover {
-    color: #202832;
-    background: rgba(255, 255, 255, 0.72);
-  }
-  .win-btn:active {
-    transform: scale(0.96);
-  }
-  .win-btn svg {
-    width: 11px;
-    height: 11px;
-    stroke: currentColor;
-    stroke-width: 1.35;
-    stroke-linecap: round;
-    opacity: 1;
-  }
-  .win-btn.minimize {
-    color: #727b86;
-  }
-  .win-btn.close {
-    color: #e64f58;
-  }
-  .win-btn.close:hover {
-    color: #b5202e;
-    background: rgba(244, 91, 91, 0.15);
-  }
-  .main-content {
-    position: relative;
-    z-index: 2;
-    padding: 0 40px 35px;
-  }
-  .update-status {
-    margin-bottom: 25px;
-    max-width: min(650px, 100%);
-  }
-  .title-group {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 8px;
-  }
-  .spinner {
-    width: 22px;
-    height: 22px;
-    border: 2.5px solid rgba(255, 255, 255, 0.24);
-    border-top-color: var(--text-main);
-    border-radius: 50%;
-    animation: spin 0.9s linear infinite;
-    flex: 0 0 auto;
-  }
-  .err-dot {
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    background: #ffffff;
-    color: #c73532;
-    align-items: center;
-    justify-content: center;
-    font-size: 14px;
-    font-weight: 800;
-    box-shadow: 0 5px 16px rgba(0, 0, 0, 0.2);
-    flex: 0 0 auto;
-  }
-  .main-action-text {
-    min-width: 0;
-    color: var(--text-main);
-    font-size: 24px;
-    line-height: 1.2;
-    font-weight: 620;
-    letter-spacing: 0;
-    text-shadow: 0 2px 10px rgba(0, 0, 0, 0.32);
-  }
-  .sub-action-text {
-    color: var(--text-sub);
-    font-size: 12px;
-    font-weight: 480;
-    letter-spacing: 1.2px;
-    line-height: 1.45;
-    margin: 0;
-    max-width: min(650px, 100%);
-    max-height: 54px;
-    overflow: hidden;
-    text-shadow: 0 1px 5px rgba(0, 0, 0, 0.28);
-    white-space: pre-line;
-  }
-  .progress-container {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 15px;
-  }
-  .progress-bar-bg {
-    grid-column: 1;
-    grid-row: 1;
-    width: 100%;
-    height: 5px;
-    border-radius: 999px;
-    background: rgba(255, 255, 255, 0.2);
-    overflow: hidden;
-    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.12);
-    backdrop-filter: blur(8px);
-  }
-  .progress-bar-fill {
-    width: 4%;
-    height: 100%;
-    border-radius: inherit;
-    background: linear-gradient(90deg, #4facfe, #43d7f5);
-    box-shadow: 0 0 10px rgba(67, 215, 245, 0.38);
-    position: relative;
-    overflow: hidden;
-    transition: width 0.35s cubic-bezier(.23, 1, .32, 1), background-color 0.2s ease;
-  }
-  .progress-bar-fill::after {
-    display: none;
-  }
-  .progress-bar-fill-error {
-    background: linear-gradient(90deg, #ff5f57, #ffbd2e);
-    box-shadow: 0 0 14px rgba(255, 95, 87, 0.46);
-  }
-  .progress-bar-fill-error::after {
-    display: none;
-  }
-  .progress-percentage {
-    grid-column: 2;
-    grid-row: 1;
-    min-width: 34px;
-    color: var(--text-main);
-    font-size: 12px;
-    font-weight: 560;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-    text-shadow: 0 1px 5px rgba(0, 0, 0, 0.28);
-  }
-  .uv-progress-container {
-    display: none;
-    margin-top: -3px;
-    margin-bottom: 15px;
-  }
-  .uv-progress-container.is-visible {
-    display: block;
-  }
-  .uv-progress-header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 6px;
-    color: var(--text-sub);
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
-  }
-  .uv-progress-detail {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-align: right;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .uv-progress-bar-bg {
-    width: 100%;
-    height: 4px;
-    overflow: hidden;
-    border-radius: 999px;
-    background: rgba(255, 255, 255, 0.14);
-  }
-  .uv-progress-bar-fill {
-    position: relative;
-    width: 2%;
-    height: 100%;
-    overflow: hidden;
-    border-radius: inherit;
-    background: #55cda0;
-    box-shadow: 0 0 8px rgba(85, 205, 160, 0.34);
-    transition: width 0.4s cubic-bezier(.23, 1, .32, 1);
-  }
-  .uv-progress-bar-fill::after {
-    display: none;
-  }
-  .footer-info {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 16px;
-    min-height: 28px;
-    font-size: 12px;
-  }
-  .tip-text {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-    max-width: 520px;
-    color: var(--text-sub);
-    background: rgba(15, 23, 42, 0.26);
-    border: 1px solid rgba(255, 255, 255, 0.16);
-    border-radius: 12px;
-    padding: 7px 12px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-weight: 460;
-    backdrop-filter: blur(12px) saturate(1.1);
-  }
-  .tip-text::before {
-    content: "✦";
-    color: var(--primary-color);
-    font-size: 12px;
-    line-height: 1;
-    text-shadow: 0 0 10px rgba(79, 172, 254, 0.55);
-    flex: 0 0 auto;
-  }
-  .footer-right {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 10px;
-    flex: 0 0 auto;
-  }
-  .notice-text {
-    color: var(--text-muted);
-    white-space: nowrap;
-    font-weight: 450;
-  }
-  .splash-actions {
-    display: none;
-  }
-  .splash-actions-err {
-    display: block;
-  }
-  .splash-log-button {
-    min-height: 34px;
-    border: 1px solid rgba(255, 255, 255, 0.78);
-    border-radius: 12px;
-    padding: 0 14px;
-    color: #394451;
-    background: rgba(250, 250, 247, 0.78);
-    box-shadow: 0 4px 14px rgba(61, 79, 97, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.36);
-    backdrop-filter: blur(14px) saturate(1.15);
-    cursor: pointer;
-    font-size: 12px;
-    font-weight: 560;
-    transition: transform 140ms cubic-bezier(.23, 1, .32, 1), background-color 140ms ease;
-  }
-  .splash-log-button:hover {
-    background: rgba(255, 255, 255, 0.9);
-  }
-  .splash-log-button:active {
-    transform: scale(0.97);
-  }
-  .splash-log-button:disabled {
-    cursor: default;
-    opacity: 0.65;
-  }
-  body.error-state .status-badge {
-    background: rgba(255, 255, 255, 0.18);
-    animation: none;
-  }
-  body.error-state .status-badge::before {
-    background: #ff5f57;
-    box-shadow: 0 0 12px rgba(255, 95, 87, 0.76);
-  }
-  body.error-state .tip-text {
-    border-color: rgba(255, 189, 46, 0.42);
-  }
-  body.error-state .tip-text::before {
-    color: #ffbd2e;
-  }
-  @media (max-width: 720px) {
-    .top-bar {
-      padding: 10px 16px;
-    }
-    .status-badge {
-      max-width: 180px;
-    }
-    .main-content {
-      padding: 0 28px 28px;
-    }
-    .main-action-text {
-      font-size: 22px;
-    }
-  }
-  @media (max-width: 560px), (max-height: 340px) {
-    .top-right {
-      gap: 12px;
-    }
-    .status-badge {
-      display: none;
-    }
-    .footer-info {
-      flex-direction: column;
-      align-items: flex-start;
-      gap: 8px;
-    }
-    .footer-right {
-      width: 100%;
-      justify-content: space-between;
-    }
-    .tip-text {
-      max-width: 100%;
-    }
-  }
-  @media (max-height: 340px) {
-    .main-content {
-      padding-bottom: 24px;
-    }
-    .update-status {
-      margin-bottom: 18px;
-    }
-    .sub-action-text {
-      max-height: 36px;
-    }
-  }
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-</style>
-</head>
-<body>
-  <div class="launcher-window">
-    <video class="splash-background-video" autoplay muted loop playsinline preload="auto" aria-hidden="true">
-      <source src="data:video/mp4;base64,$VIDEO_BG" type="video/mp4">
-    </video>
-    <div id="splash-drag-region" class="top-bar">
-      <div class="brand-zone">
-        <span class="app-title">AzurPilot</span>
-        <span class="app-version">v$LAUNCHER_VERSION</span>
-      </div>
-      <div class="top-right">
-        <div id="badge" class="status-badge">
-          <span id="badge-text">$I18N_INITIALIZING</span>
-        </div>
-        <div class="window-controls">
-          <button id="window-minimize" class="win-btn minimize" type="button" aria-label="$I18N_MINIMIZE" title="$I18N_MINIMIZE">
-            <svg viewBox="0 0 8 8" aria-hidden="true"><line x1="2" y1="4" x2="6" y2="4"></line></svg>
-          </button>
-          <button id="window-close" class="win-btn close" type="button" aria-label="$I18N_CLOSE" title="$I18N_CLOSE">
-            <svg viewBox="0 0 8 8" aria-hidden="true"><line x1="2" y1="2" x2="6" y2="6"></line><line x1="6" y1="2" x2="2" y2="6"></line></svg>
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div class="main-content">
-      <div class="update-status">
-        <div class="title-group">
-          <div id="spinner" class="spinner"></div>
-          <div id="error-dot" class="err-dot" style="display:none;">!</div>
-          <h1 id="title" class="main-action-text">$I18N_STARTING</h1>
-        </div>
-        <p id="detail" class="sub-action-text">$I18N_WEBUI_INIT</p>
-      </div>
-
-      <div class="progress-container">
-        <div id="progress-pct" class="progress-percentage">4%</div>
-        <div class="progress-bar-bg">
-          <div id="progress-fill" class="progress-bar-fill" style="width: 4%;"></div>
-        </div>
-      </div>
-
-      <div id="uv-progress-container" class="uv-progress-container" aria-hidden="true">
-        <div class="uv-progress-header">
-          <span id="uv-progress-detail" class="uv-progress-detail"></span>
-          <span id="uv-progress-pct">0%</span>
-        </div>
-        <div class="uv-progress-bar-bg">
-          <div id="uv-progress-fill" class="uv-progress-bar-fill" style="width: 2%;"></div>
-        </div>
-      </div>
-
-      <div class="footer-info">
-        <div id="tip-text" class="tip-text">$I18N_DEFAULT_TIP</div>
-        <div class="footer-right">
-          <div id="progress-meta" class="notice-text">$I18N_PROGRESS_META</div>
-          <div id="splash-actions" class="splash-actions">
-            <button id="splash-log-button" class="splash-log-button" type="button">$I18N_DOWNLOAD_LOG</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    const i18n = $I18N_JSON;
-    const defaultTip = i18n.defaultTip;
-    const invoke =
-      (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
-      || (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke);
-    const webviewDraggableRegionsEnabled = $NATIVE_TOUCH_DRAG;
-
-    window.addEventListener('contextmenu', event => {
-      event.preventDefault();
-    }, { capture: true });
-
-    function splitSubtitle(value) {
-      const text = String(value || '').trim();
-      if (!text) {
-        return { status: i18n.loading, tip: defaultTip };
-      }
-      const match = text.match(/^(.*?)\s*\|\s*Tips[:：]\s*(.*)$/);
-      if (!match) {
-        return { status: text, tip: defaultTip };
-      }
-      return {
-        status: match[1].trim() || i18n.loading,
-        tip: match[2].trim() || defaultTip,
-      };
-    }
-
-    function normalizeDetail(value) {
-      const text = String(value || '').trim();
-      return text || i18n.webuiInit;
-    }
-
-    window.__ALAS_SPLASH_UPDATE = function (payload) {
-      const badge = document.getElementById('badge');
-      const badgeText = document.getElementById('badge-text');
-      const spinner = document.getElementById('spinner');
-      const errorDot = document.getElementById('error-dot');
-      const progressFill = document.getElementById('progress-fill');
-      const progressPct = document.getElementById('progress-pct');
-      const uvProgressContainer = document.getElementById('uv-progress-container');
-      const uvProgressFill = document.getElementById('uv-progress-fill');
-      const uvProgressPct = document.getElementById('uv-progress-pct');
-      const uvProgressDetail = document.getElementById('uv-progress-detail');
-      const progressMeta = document.getElementById('progress-meta');
-      const splashActions = document.getElementById('splash-actions');
-      const subtitle = splitSubtitle(payload.subtitle);
-
-      badgeText.textContent = payload.is_error ? i18n.errorBadge : subtitle.status;
-      document.getElementById('tip-text').textContent = subtitle.tip;
-      document.getElementById('title').textContent = payload.title || i18n.starting;
-      document.getElementById('detail').textContent = normalizeDetail(payload.detail);
-      progressMeta.textContent = payload.is_error
-        ? i18n.initStopped
-        : i18n.progressMetaReady;
-
-      const progress = Math.max(0, Math.min(100, Number(payload.progress || 0)));
-      progressFill.style.width = progress + '%';
-      progressPct.textContent = progress + '%';
-
-      const uvState = payload.uv_progress;
-      const hasUvProgress = !payload.is_error
-        && uvState
-        && Number.isFinite(Number(uvState.progress));
-      uvProgressContainer.classList.toggle('is-visible', Boolean(hasUvProgress));
-      uvProgressContainer.setAttribute('aria-hidden', String(!hasUvProgress));
-      if (hasUvProgress) {
-        const uvProgress = Math.max(0, Math.min(99, Number(uvState.progress)));
-        uvProgressFill.style.width = uvProgress + '%';
-        uvProgressPct.textContent = uvProgress + '%';
-        uvProgressDetail.textContent = String(uvState.detail || '');
-      }
-
-      if (payload.is_error) {
-        document.body.classList.add('error-state');
-        badge.className = 'status-badge status-badge-err';
-        spinner.style.display = 'none';
-        errorDot.style.display = 'flex';
-        progressFill.className = 'progress-bar-fill progress-bar-fill-error';
-        splashActions.className = 'splash-actions splash-actions-err';
-      } else {
-        document.body.classList.remove('error-state');
-        badge.className = 'status-badge';
-        spinner.style.display = 'block';
-        errorDot.style.display = 'none';
-        progressFill.className = 'progress-bar-fill';
-        splashActions.className = 'splash-actions';
-      }
-    };
-
-    const splashDragRegion = document.getElementById('splash-drag-region');
-    splashDragRegion.addEventListener('pointerdown', event => {
-      if (!event.isPrimary || event.button !== 0 || event.target.closest('button')) {
-        return;
-      }
-      if (webviewDraggableRegionsEnabled) {
-        return;
-      }
-      event.preventDefault();
-      if (typeof invoke !== 'function') {
-        return;
-      }
-      invoke('window_start_dragging').catch(error => {
-        console.error('Failed to drag splash window', error);
-      });
-    });
-
-    document.getElementById('window-minimize').addEventListener('click', event => {
-      event.stopPropagation();
-      if (typeof invoke === 'function') {
-        invoke('window_minimize').catch(error => {
-          console.error('Failed to minimize splash window', error);
-        });
-      }
-    });
-
-    document.getElementById('window-close').addEventListener('click', event => {
-      event.stopPropagation();
-      if (typeof invoke === 'function') {
-        invoke('window_close').catch(error => {
-          console.error('Failed to close splash window', error);
-        });
-      }
-    });
-
-    document.getElementById('splash-log-button').addEventListener('click', async () => {
-      const button = document.getElementById('splash-log-button');
-      const progressMeta = document.getElementById('progress-meta');
-      button.disabled = true;
-      progressMeta.textContent = i18n.preparingLog;
-      try {
-        if (typeof invoke !== 'function') {
-          throw new Error('Tauri invoke is unavailable');
-        }
-        const filename = await invoke('download_today_launcher_log');
-        progressMeta.textContent = i18n.logSavedPrefix + filename;
-      } catch (error) {
-        progressMeta.textContent = i18n.logFailed + (error && error.message ? error.message : error);
-      } finally {
-        button.disabled = false;
-      }
-    });
-
-    window.__ALAS_SPLASH_READY = true;
-  </script>
-</body>
-</html>"#
-    .replace("$VIDEO_BG", video_bg_b64)
-    .replace("$MI_SANS_FONT", mi_sans_font_b64)
-    .replace("$LAUNCHER_VERSION", env!("CARGO_PKG_VERSION"))
-    .replace("$I18N_JSON", &i18n_json)
-    .replace("$NATIVE_TOUCH_DRAG", if cfg!(windows) { "true" } else { "false" })
-    .replace("$I18N_INITIALIZING", &escape_html(t!("splash.initializing")))
-    .replace("$I18N_MINIMIZE", &escape_html(t!("titlebar.minimize")))
-    .replace("$I18N_CLOSE", &escape_html(t!("titlebar.close")))
-    .replace("$I18N_STARTING", &escape_html(t!("splash.starting")))
-    .replace("$I18N_WEBUI_INIT", &escape_html(t!("splash.webui_init")))
-    .replace("$I18N_DEFAULT_TIP", &escape_html(t!("tips.17")))
-    .replace("$I18N_PROGRESS_META", &escape_html(t!("splash.progress_meta_ready")))
-    .replace("$I18N_DOWNLOAD_LOG", &escape_html(t!("splash.download_log")))
-}
-
-fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<WebviewWindow> {
-    let main_config = app
-        .config()
-        .app
-        .windows
-        .iter()
-        .find(|w| w.label == "main")
-        .ok_or_else(|| anyhow!("Main window config not found"))?;
-
-    let app_for_navigation = app.clone();
-    let main_window = tauri::WebviewWindowBuilder::from_config(app, main_config)?
-        .on_navigation(move |url| handle_backend_navigation(app_for_navigation.clone(), port, url))
-        .on_page_load(page_load_injector)
-        .build()?;
-    main_window.set_resizable(true)?;
-
-    // Windows/Linux: remove native decorations for the main window as well.
-    // Splash is configured as borderless in tauri.conf.json.
-    #[cfg(not(target_os = "macos"))]
-    {
-        main_window.set_decorations(false)?;
-    }
-
-    Ok(main_window)
-}
-
-fn reveal_window(window: &WebviewWindow) -> tauri::Result<()> {
-    if window.is_minimized()? {
-        window.unminimize()?;
-    }
-    window.show()?;
-    window.set_focus()?;
-    Ok(())
-}
-
-fn minimize_main_window_to_tray(app: &tauri::AppHandle) {
-    #[cfg(windows)]
-    {
-        if let Some(window) = app.get_webview_window("main") {
-            info!("Destroying main window to release WebView resources while trayed");
-            if let Err(e) = window.destroy() {
-                warn!("Failed to destroy main window for tray mode: {:?}", e);
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.hide();
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        set_macos_activation_policy(app, false);
-    }
-}
-
-fn restore_main_window_from_any_thread(
-    app: tauri::AppHandle,
-    port: u16,
-    recreating_main_window: Arc<AtomicBool>,
-) {
-    let app_for_restore = app.clone();
-    if let Err(e) = app.run_on_main_thread(move || {
-        restore_main_window_from_tray(&app_for_restore, port, recreating_main_window);
-    }) {
-        warn!("Failed to schedule main window restore: {:?}", e);
-    }
-}
-
-fn restore_main_window_from_tray(
-    app: &tauri::AppHandle,
-    port: u16,
-    recreating_main_window: Arc<AtomicBool>,
-) {
-    if let Some(window) = app.get_webview_window("main") {
-        #[cfg(target_os = "macos")]
-        set_macos_activation_policy(app, true);
-        let _ = reveal_window(&window);
-        return;
-    }
-
-    if recreating_main_window
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        debug!("Main window recreation already in progress");
-        return;
-    }
-
-    let app_handle = app.clone();
-    thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        set_macos_activation_policy(&app_handle, true);
-
-        let result = (|| -> Result<()> {
-            let window = create_main_window(&app_handle, port)?;
-            navigate_backend_or_error(&window, port)?;
-            reveal_window(&window)?;
-            Ok(())
-        })();
-
-        recreating_main_window.store(false, Ordering::SeqCst);
-
-        if let Err(e) = result {
-            error!("Failed to recreate main window from tray: {:?}", e);
-        }
-    });
-}
-
-fn toggle_main_window_visibility(
-    app: &tauri::AppHandle,
-    port: u16,
-    recreating_main_window: Arc<AtomicBool>,
-) {
-    if let Some(window) = app.get_webview_window("main") {
-        let is_visible = window.is_visible().unwrap_or(false);
-        let is_minimized = window.is_minimized().unwrap_or(false);
-        if is_visible && !is_minimized {
-            minimize_main_window_to_tray(app);
-        } else {
-            restore_main_window_from_tray(app, port, recreating_main_window);
-        }
-    } else {
-        restore_main_window_from_tray(app, port, recreating_main_window);
-    }
-}
-
-fn main_window_titlebar_injection_script() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        String::new()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let i18n = serde_json::json!({
-            "hideLabel": t!("titlebar.minimize_to_tray"),
-            "minimizeLabel": t!("titlebar.minimize_window"),
-            "minimizeTitle": t!("titlebar.minimize"),
-            "maximizeLabel": t!("titlebar.maximize_restore_window"),
-            "maximizeTitle": t!("titlebar.maximize"),
-            "closeLabel": t!("titlebar.close_window"),
-            "closeTitle": t!("titlebar.close"),
-            "restoreTitle": t!("titlebar.restore"),
-            "maximizeActionTitle": t!("titlebar.maximize_action"),
-            "restoreLabel": t!("titlebar.restore_window"),
-            "maximizeLabelText": t!("titlebar.maximize_window"),
-            "closePrompt": t!("dialog.confirm_exit"),
-            "exitAction": t!("dialog.exit"),
-            "minimizeToTrayAction": t!("dialog.minimize_to_tray"),
-        });
-        let i18n_json = serde_json::to_string(&i18n).unwrap();
-        let mut s = String::with_capacity(8192);
-        s.push_str("const i18n = ");
-        s.push_str(&i18n_json);
-        s.push_str(if cfg!(windows) {
-            ";const webviewDraggableRegionsEnabled = true;const closePromptEnabled = true;"
-        } else {
-            ";const webviewDraggableRegionsEnabled = false;const closePromptEnabled = false;"
-        });
-        s.push_str(r#";
-        const invoke =
-            (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
-            || (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke);
-        if (typeof invoke !== 'function') {
-            return;
-        }
-        const ensureTitlebar = () => {
-            if (!document.body || document.getElementById('alas-launcher-titlebar')) {
-                return;
-            }
-            if (!document.getElementById('alas-launcher-titlebar-style')) {
-                const style = document.createElement('style');
-                style.id = 'alas-launcher-titlebar-style';
-                style.textContent = ':root{--alas-titlebar-height:56px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 148px 0 0;height:100%;pointer-events:none;background:transparent;touch-action:none}.alas-titlebar-drag-segment{position:absolute;top:0;bottom:0;pointer-events:auto;background:transparent;touch-action:none;app-region:drag;-webkit-app-region:drag}.header-icon,.header-icon *{app-region:no-drag;-webkit-app-region:no-drag}.header-icon{display:flex;align-items:center;gap:3px;padding:3px 4px;position:absolute;top:10px;right:10px;height:36px;pointer-events:auto;border:1px solid rgba(255,255,255,.92);border-radius:18px;background:rgba(250,250,247,.78);box-shadow:0 4px 14px rgba(61,79,97,.1),inset 0 1px 0 rgba(255,255,255,.36);backdrop-filter:blur(16px) saturate(1.2);-webkit-backdrop-filter:blur(16px) saturate(1.2)}.icon{width:28px;height:28px;min-width:28px;min-height:28px;margin:0;padding:0;line-height:1;border-radius:12px;border:none;background:transparent;color:#727b86;cursor:pointer;flex:0 0 auto;position:relative;transition:transform 140ms cubic-bezier(.23,1,.32,1),background-color 140ms ease,color 140ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:hover{color:#202832;background:rgba(255,255,255,.72)}.icon:active{transform:scale(.96)}.icon-close{color:#e64f58}.icon-close:hover{color:#b5202e;background:rgba(244,91,91,.15)}.icon svg{width:11px;height:11px;stroke:currentColor;fill:none;stroke-width:1.2;stroke-linecap:round;stroke-linejoin:round;opacity:1}';
-                style.textContent += '#alas-close-menu{position:fixed;top:8px;right:10px;z-index:2147483647;width:272px;padding:14px;border:1px solid rgba(255,255,255,.9);border-radius:20px;background:rgba(250,250,247,.94);box-shadow:0 18px 46px rgba(46,58,72,.2),inset 0 1px 0 rgba(255,255,255,.7);backdrop-filter:blur(20px) saturate(1.18);-webkit-backdrop-filter:blur(20px) saturate(1.18);color:#202832;opacity:0;pointer-events:none;transform:translateY(-6px) scale(.96);transform-origin:calc(100% - 64px) 0;transition:opacity 140ms ease,transform 180ms cubic-bezier(.23,1,.32,1);app-region:no-drag;-webkit-app-region:no-drag}#alas-close-menu.is-open{opacity:1;pointer-events:auto;transform:translateY(0) scale(1)}#alas-close-menu *{box-sizing:border-box;app-region:no-drag;-webkit-app-region:no-drag}#alas-close-menu-title{margin:0 0 12px;font:500 13px/1.55 "MiSans",sans-serif;color:rgba(32,40,50,.82)}#alas-close-menu-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}#alas-close-menu button{display:flex;align-items:center;justify-content:center;min-width:0;min-height:36px;margin:0;padding:0 12px;border:1px solid rgba(92,105,120,.16);border-radius:11px;background:rgba(105,118,133,.08);color:#394451;font:600 12px/1 "MiSans",sans-serif;cursor:pointer;transition:background-color 140ms ease,color 140ms ease,transform 140ms cubic-bezier(.23,1,.32,1)}#alas-close-menu button:hover{transform:translateY(-1px);background:rgba(105,118,133,.14)}#alas-close-menu button:active{transform:scale(.98)}#alas-close-menu button:disabled{opacity:.55;cursor:default;transform:none}#alas-close-menu .alas-close-confirm{border-color:rgba(205,62,69,.28);background:#d94b4b;color:#fff}#alas-close-menu .alas-close-confirm:hover{background:#c93e3e;color:#fff}';
-                document.head.appendChild(style);
-            }
-            const titlebar = document.createElement('div');
-            titlebar.id = 'alas-launcher-titlebar';
-            titlebar.innerHTML = '<div class="alas-titlebar-drag-zone" aria-hidden="true"><div class="alas-titlebar-drag-segment" style="left:0;right:0"></div></div><div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="'+i18n.hideLabel+'" title="'+i18n.hideLabel+'"><svg viewBox="0 0 6 6"><rect x="1" y="1" width="4" height="4" rx="1"/><path d="M2 3h2"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="'+i18n.minimizeLabel+'" title="'+i18n.minimizeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="3" x2="5" y2="3"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="'+i18n.maximizeLabel+'" title="'+i18n.maximizeTitle+'"><svg viewBox="0 0 6 6" class="svg-restore" style="display:none"><polyline points="1,3 1,1 3,1"/><polyline points="3,5 5,5 5,3"/></svg><svg viewBox="0 0 6 6" class="svg-maximize"><polyline points="1,2.5 1,1 2.5,1"/><polyline points="3.5,5 5,5 5,3.5"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="'+i18n.closeLabel+'" title="'+i18n.closeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="1" x2="5" y2="5"/><line x1="5" y1="1" x2="1" y2="5"/></svg></button></div>';
-            document.body.dataset.alasCustomTitlebar = 'true';
-            document.body.prepend(titlebar);
-            const dragZone = titlebar.querySelector('.alas-titlebar-drag-zone');
-            const maximizeButton = titlebar.querySelector('[data-action="maximize"]');
-            let closeMenu = document.getElementById('alas-close-menu');
-            if (!closeMenu) {
-                closeMenu = document.createElement('div');
-                closeMenu.id = 'alas-close-menu';
-                closeMenu.setAttribute('role', 'dialog');
-                closeMenu.setAttribute('aria-modal', 'false');
-                closeMenu.innerHTML = '<p id="alas-close-menu-title"></p><div id="alas-close-menu-actions"><button type="button" data-close-action="minimize"></button><button type="button" class="alas-close-confirm" data-close-action="exit"></button></div>';
-                closeMenu.querySelector('#alas-close-menu-title').textContent = i18n.closePrompt;
-                closeMenu.querySelector('[data-close-action="minimize"]').textContent = i18n.minimizeToTrayAction;
-                closeMenu.querySelector('[data-close-action="exit"]').textContent = i18n.exitAction;
-                closeMenu.addEventListener('pointerdown', event => event.stopPropagation());
-                document.body.appendChild(closeMenu);
-            }
-            const setCloseMenuOpen = open => {
-                closeMenu.classList.toggle('is-open', open);
-                if (open) closeMenu.querySelector('[data-close-action="minimize"]').focus({ preventScroll: true });
-            };
-            const showClosePrompt = () => {
-                if (!closePromptEnabled) {
-                    invoke('window_close').catch(error => console.error('Failed to close window', error));
-                    return;
-                }
-                setCloseMenuOpen(true);
-            };
-            window.__ALAS_OPEN_CLOSE_PROMPT = showClosePrompt;
-            closeMenu.querySelector('[data-close-action="minimize"]').addEventListener('click', async () => {
-                setCloseMenuOpen(false);
-                try { await invoke('window_hide'); }
-                catch (error) { console.error('Failed to minimize window to tray', error); }
-            });
-            closeMenu.querySelector('[data-close-action="exit"]').addEventListener('click', async () => {
-                closeMenu.querySelectorAll('button').forEach(button => { button.disabled = true; });
-                try { await invoke('window_exit_application'); }
-                catch (error) {
-                    closeMenu.querySelectorAll('button').forEach(button => { button.disabled = false; });
-                    console.error('Failed to exit application', error);
-                }
-            });
-            document.addEventListener('pointerdown', event => {
-                if (closeMenu.classList.contains('is-open') && !closeMenu.contains(event.target)) setCloseMenuOpen(false);
-            });
-            document.addEventListener('keydown', event => {
-                if (event.key === 'Escape' && closeMenu.classList.contains('is-open')) setCloseMenuOpen(false);
-            });
-            const interactiveSelector = 'a[href],button,input,select,textarea,summary,label[for],[role="button"],[role="link"],[contenteditable="true"],[tabindex]:not([tabindex="-1"]),[onclick]';
-            const rebuildDragSegments = () => {
-                const dragRect = dragZone.getBoundingClientRect();
-                const dragWidth = Math.max(0, dragRect.width);
-                const exclusions = [];
-                document.body.querySelectorAll('*').forEach(element => {
-                    if (titlebar.contains(element) || element.closest('#alas-close-menu')) return;
-                    const rect = element.getBoundingClientRect();
-                    if (rect.width <= 0 || rect.height <= 0 || rect.bottom <= dragRect.top || rect.top >= dragRect.bottom || rect.right <= dragRect.left || rect.left >= dragRect.right) return;
-                    if (!element.matches(interactiveSelector) && getComputedStyle(element).cursor !== 'pointer') return;
-                    const left = Math.max(0, Math.floor(rect.left - dragRect.left) - 3);
-                    const right = Math.min(dragWidth, Math.ceil(rect.right - dragRect.left) + 3);
-                    if (right > left) exclusions.push([left, right]);
-                });
-                exclusions.sort((a, b) => a[0] - b[0]);
-                const merged = [];
-                exclusions.forEach(interval => {
-                    const previous = merged[merged.length - 1];
-                    if (previous && interval[0] <= previous[1]) previous[1] = Math.max(previous[1], interval[1]);
-                    else merged.push(interval);
-                });
-                const fragment = document.createDocumentFragment();
-                const appendSegment = (left, right) => {
-                    if (right - left < 4) return;
-                    const segment = document.createElement('div');
-                    segment.className = 'alas-titlebar-drag-segment';
-                    segment.style.left = left + 'px';
-                    segment.style.width = (right - left) + 'px';
-                    fragment.appendChild(segment);
-                };
-                let cursor = 0;
-                merged.forEach(interval => {
-                    appendSegment(cursor, interval[0]);
-                    cursor = Math.max(cursor, interval[1]);
-                });
-                appendSegment(cursor, dragWidth);
-                dragZone.replaceChildren(fragment);
-            };
-            let dragSegmentFrame = 0;
-            const scheduleDragSegmentRebuild = () => {
-                cancelAnimationFrame(dragSegmentFrame);
-                dragSegmentFrame = requestAnimationFrame(rebuildDragSegments);
-            };
-            const dragSegmentObserver = new MutationObserver(mutations => {
-                if (mutations.some(mutation => !titlebar.contains(mutation.target))) scheduleDragSegmentRebuild();
-            });
-            dragSegmentObserver.observe(document.body, {
-                subtree: true,
-                childList: true,
-                characterData: true,
-                attributes: true,
-                attributeFilter: ['class', 'style', 'hidden', 'disabled', 'href', 'role', 'tabindex'],
-            });
-            document.addEventListener('scroll', scheduleDragSegmentRebuild, { capture: true, passive: true });
-            rebuildDragSegments();
-            const syncMaximizeState = async () => {
-                if (!maximizeButton) return;
-                try {
-                    const maximized = await invoke('window_is_maximized');
-                    maximizeButton.dataset.maximized = maximized ? 'true' : 'false';
-                    maximizeButton.title = maximized ? i18n.restoreTitle : i18n.maximizeActionTitle;
-                    maximizeButton.setAttribute('aria-label', maximized ? i18n.restoreLabel : i18n.maximizeLabelText);
-                    maximizeButton.querySelector('.svg-maximize').style.display = maximized ? 'none' : '';
-                    maximizeButton.querySelector('.svg-restore').style.display = maximized ? '' : 'none';
-                } catch (e) {
-                    console.error('Failed to sync maximize state', e);
-                }
-            };
-            titlebar.querySelectorAll('button[data-action]').forEach(button => {
-                button.addEventListener('click', async event => {
-                    event.stopPropagation();
-                    try {
-                        switch (button.dataset.action) {
-                            case 'hide': await invoke('window_hide'); break;
-                            case 'minimize': await invoke('window_minimize'); break;
-                            case 'maximize': await invoke('window_toggle_maximize'); await syncMaximizeState(); break;
-                            case 'close': showClosePrompt(); break;
-                        }
-                    } catch (error) {
-                        console.error('Failed to handle ' + button.dataset.action + ' window action', error);
-                    }
-                });
-            });
-            dragZone.addEventListener('pointerdown', event => {
-                if (!event.isPrimary || event.button !== 0 || event.target.closest('button')) return;
-                if (webviewDraggableRegionsEnabled) return;
-                event.preventDefault();
-                invoke('window_start_dragging').catch(error => { console.error('Failed to start dragging from titlebar', error); });
-            });
-            dragZone.addEventListener('dblclick', async event => {
-                if (event.target.closest('button')) return;
-                try { await invoke('window_toggle_maximize'); await syncMaximizeState(); }
-                catch (error) { console.error('Failed to toggle maximize from titlebar', error); }
-            });
-            window.addEventListener('resize', () => { scheduleDragSegmentRebuild(); void syncMaximizeState(); });
-            void syncMaximizeState();
-        };
-        ensureTitlebar();
-        if (!document.body) {
-            window.addEventListener('DOMContentLoaded', ensureTitlebar, { once: true });
-        }
-        "#);
-        s
+        assert_eq!(fs::read(&path).expect("read truncated log"), b"");
     }
 }

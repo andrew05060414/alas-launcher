@@ -1,688 +1,643 @@
-#[cfg(windows)]
-use std::{
-    env,
-    ffi::{OsStr, OsString},
-    fs::{self, File},
-    io::{self, Read, Write},
-    mem::size_of,
-    os::windows::ffi::{OsStrExt, OsStringExt},
-    path::{Path, PathBuf},
-    process::Command,
-    ptr,
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
-    time::Duration,
-};
+//! 后端前端构建所需的 Node.js：复用达标环境，否则自动下载经过摘要校验的
+//! 便携发行包。只为子进程设置 PATH，不修改系统安装或全局环境变量。
 
-#[cfg(windows)]
+use crate::http_client::Client;
 use anyhow::{bail, Context, Result};
-#[cfg(windows)]
-use rand::RngCore;
-#[cfg(windows)]
-use reqwest::blocking::Client;
-#[cfg(windows)]
+use rust_i18n::t;
 use sha2::{Digest, Sha256};
-#[cfg(windows)]
+use std::{
+    env, fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{atomic::AtomicBool, mpsc, Arc},
+    thread,
+    time::{Duration, Instant},
+};
 use tracing::{info, warn};
 
-#[cfg(windows)]
-use crate::{setup::SplashUpdate, window_util::CreateNoWindow as _};
-#[cfg(windows)]
-use rust_i18n::t;
-#[cfg(windows)]
-use winapi::{
-    shared::sddl::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
-    um::{
-        fileapi::CreateDirectoryW, minwinbase::SECURITY_ATTRIBUTES,
-        sysinfoapi::GetSystemDirectoryW, winbase::LocalFree, winnt::PSECURITY_DESCRIPTOR,
-    },
+use crate::{
+    launcher::ensure_not_cancelled, progress::SplashUpdate, sources::Preferences,
+    task_process::TaskChild,
 };
 
-// Keep the installer URL and checksum together so the downloaded executable is
-// authenticated independently of the network response that carries it.
-#[cfg(windows)]
-const NODEJS_LTS_VERSION: &str = "24.21.0";
-#[cfg(windows)]
-const NODEJS_LTS_X64_MSI_URL: &str = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-x64.msi";
-#[cfg(windows)]
-const NODEJS_LTS_X64_MSI_SHA256: &str =
-    "bb0eaee134f9357f22aea915ee793343e627aefc1e66488164bac6915bce2cac";
-#[cfg(windows)]
-const NODEJS_LTS_ARM64_MSI_URL: &str = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-arm64.msi";
-#[cfg(windows)]
-const NODEJS_LTS_ARM64_MSI_SHA256: &str =
-    "22ca85110f26015696a3fa9216bc372ae65203d170622eaf7d211e2dd5bb49e3";
-#[cfg(windows)]
-const NODEJS_LTS_X86_VERSION: &str = "22.22.2";
-#[cfg(windows)]
-const NODEJS_LTS_X86_MSI_URL: &str = "https://nodejs.org/dist/v22.22.2/node-v22.22.2-x86.msi";
-#[cfg(windows)]
-const NODEJS_LTS_X86_MSI_SHA256: &str =
-    "e43cf42f461cbfea23a079925cfdd132a18cf66d4e30f64ec5ab4ec31dbb41f3";
-#[cfg(windows)]
-const NODEJS_DOWNLOAD_BUFFER_BYTES: usize = 64 * 1024;
-#[cfg(windows)]
-const NODEJS_INSTALLER_POLL_INTERVAL: Duration = Duration::from_millis(200);
-#[cfg(windows)]
-const NODEJS_REGISTRY_PATH: &str = r"SOFTWARE\Node.js";
-#[cfg(windows)]
-const WINDOWS_CURRENT_VERSION_REGISTRY_PATH: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion";
-#[cfg(windows)]
-const NODEJS_INSTALL_PATH_VALUE: &str = "InstallPath";
-// Protected DACL: only SYSTEM and elevated Administrators can alter files;
-// the owner-rights denial prevents a medium-integrity owner from rewriting it.
-#[cfg(windows)]
-const NODEJS_SECURE_INSTALLER_DIRECTORY_SDDL: &str =
-    "D:P(D;OICI;WDWO;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-#[cfg(windows)]
-const NODEJS_SECURE_INSTALLER_DIRECTORY_ATTEMPTS: usize = 32;
-#[cfg(windows)]
-const NODEJS_SECURE_INSTALLER_DIRECTORY_RANDOM_BYTES: usize = 16;
+// 更新版本时同时核对官方 release 的 SHASUMS256.txt，并同步六个平台的摘要。
+const VERSION: &str = "24.22.2";
+const MIN_VERSION: (u32, u32, u32) = (22, 12, 0);
+const MAX_DOWNLOAD: u64 = 200 * 1024 * 1024;
+const EXTRACT_SCRIPT: &str = include_str!("../tools/extract_nodejs.py");
 
-#[cfg(windows)]
-#[derive(Debug)]
-struct NodeJsInstallation {
-    executable: PathBuf,
-    version: String,
-}
-
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug)]
-struct NodeJsInstaller {
-    version: &'static str,
-    url: &'static str,
+struct Distribution {
+    platform: &'static str,
     sha256: &'static str,
 }
 
-#[cfg(windows)]
-struct SecureNodeJsInstallerDir {
-    path: PathBuf,
+fn distribution(os: &str, arch: &str) -> Result<Distribution> {
+    let (platform, sha256) = match (os, arch) {
+        ("windows", "x86_64") => (
+            "win-x64",
+            "ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2",
+        ),
+        ("windows", "aarch64") => (
+            "win-arm64",
+            "f47968c213105077f64c6510f007632c0ca2574802a0b5067c327c49abe1c468",
+        ),
+        ("macos", "x86_64") => (
+            "darwin-x64",
+            "d5e336d588c45be0c37dbd52cc29895593009ca4997a77a1fd02815131ed0e52",
+        ),
+        ("macos", "aarch64") => (
+            "darwin-arm64",
+            "aa9549349e47dffaa42dcf95d6e06ade8c4bdafc980979883b88767670df385a",
+        ),
+        ("linux", "x86_64") => (
+            "linux-x64",
+            "361718c444e49af2ca5a110c83ba6a8901143f23ab285ebbef0341f391f482a9",
+        ),
+        ("linux", "aarch64") => (
+            "linux-arm64",
+            "95c264150aceb7f3437a29fd6984924f5f8d1511ea3cbd6c508b83f6c555dae2",
+        ),
+        _ => bail!(t!(
+            "errors.nodejs_unsupported",
+            platform = format!("{os}-{arch}")
+        )),
+    };
+    Ok(Distribution { platform, sha256 })
 }
 
-#[cfg(windows)]
-impl SecureNodeJsInstallerDir {
-    fn new() -> Result<Self> {
-        let root = windows_temp_directory()?;
-        for _ in 0..NODEJS_SECURE_INSTALLER_DIRECTORY_ATTEMPTS {
-            let path = root.join(format!("AzurPilot-NodeJs-{}", secure_directory_suffix()));
-            match create_secure_directory(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "create protected Node.js installer directory {}",
-                            path.display()
-                        )
-                    })
+impl Distribution {
+    fn directory(&self) -> String {
+        format!("node-v{VERSION}-{}", self.platform)
+    }
+
+    fn filename(&self) -> String {
+        let extension = if self.platform.starts_with("win-") {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        format!("{}.{extension}", self.directory())
+    }
+
+    fn target(&self, root: &Path) -> Result<PathBuf> {
+        crate::components::secure_target(
+            root,
+            &format!(".azurpilot/tools/nodejs/{}", self.directory()),
+        )
+    }
+}
+
+fn bin_directory(runtime: &Path) -> PathBuf {
+    if cfg!(windows) {
+        runtime.to_owned()
+    } else {
+        runtime.join("bin")
+    }
+}
+
+fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = text.trim().strip_prefix('v')?.split('.');
+    let result = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(result)
+}
+
+/// 限时且可取消地执行探测命令，避免损坏的本地 node 挂住启动任务。
+fn node_version(node: &Path, cancel: &AtomicBool) -> Result<Option<(u32, u32, u32)>> {
+    ensure_not_cancelled(cancel)?;
+    let mut command = Command::new(node);
+    command
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+    let Ok(mut child) = TaskChild::spawn(&mut command) else {
+        return Ok(None);
+    };
+    let stdout = child.take_stdout().expect("piped stdout");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut output = String::new();
+        let result = stdout.take(128).read_to_string(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        ensure_not_cancelled(cancel)?;
+        if let Some(status) = child.try_wait()? {
+            return Ok(if status.success() {
+                receiver
+                    .recv_timeout(Duration::from_millis(100))
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .and_then(|output| parse_version(&output))
+            } else {
+                None
+            });
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn usable(bin: &Path, cancel: &AtomicBool) -> Result<bool> {
+    let node = bin.join(if cfg!(windows) { "node.exe" } else { "node" });
+    let npm = bin.join(if cfg!(windows) { "npm.cmd" } else { "npm" });
+    Ok(node.is_file()
+        && npm.is_file()
+        && node_version(&node, cancel)?.is_some_and(|version| version >= MIN_VERSION))
+}
+
+fn system_candidates() -> Vec<PathBuf> {
+    let mut paths = env::var_os("PATH")
+        .map(|path| {
+            env::split_paths(&path)
+                .filter(|p| p.is_absolute())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    #[cfg(windows)]
+    {
+        // 兼容由旧启动器下载的私有 Node.js，以及安装后尚未刷新 PATH 的系统运行时。
+        if let Some(base) = env::var_os("ProgramData") {
+            paths.push(PathBuf::from(base).join("AzurPilotLauncher/nodejs"));
+        }
+        for key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+            if let Some(base) = env::var_os(key) {
+                paths.push(PathBuf::from(base).join("nodejs"));
+            }
+        }
+    }
+    #[cfg(unix)]
+    paths.extend(["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin"].map(PathBuf::from));
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    paths
+}
+
+pub(crate) fn configure_command(command: &mut Command, bin: &Path) -> Result<()> {
+    let existing = command
+        .get_envs()
+        .find(|(key, _)| {
+            key.to_str()
+                .is_some_and(|key| key.eq_ignore_ascii_case("PATH"))
+        })
+        .map(|(_, value)| value.map(ToOwned::to_owned))
+        .unwrap_or_else(|| env::var_os("PATH"));
+    let mut paths = vec![bin.to_owned()];
+    if let Some(existing) = existing {
+        paths.extend(env::split_paths(&existing).filter(|path| path != bin));
+    }
+    command.env("PATH", env::join_paths(paths)?);
+    Ok(())
+}
+
+fn update(title: impl Into<String>, detail: impl Into<String>, progress: f64) -> SplashUpdate {
+    SplashUpdate::loading(title, detail, progress)
+        .with_subtitle(t!("setup.syncing"))
+}
+
+fn download(
+    client: &Client,
+    urls: &[String],
+    sha256: &str,
+    archive: &Path,
+    cancel: Arc<AtomicBool>,
+    status: &mut impl FnMut(SplashUpdate),
+) -> Result<()> {
+    let mut last_error = None;
+    for url in urls {
+        ensure_not_cancelled(&cancel)?;
+        let result = (|| -> Result<()> {
+            let response = crate::cancel::request(client.get(url), &cancel)?.error_for_status()?;
+            let length = response.content_length();
+            if length.is_some_and(|size| size > MAX_DOWNLOAD) {
+                bail!(t!("errors.nodejs_download_limit"));
+            }
+            let mut body = crate::cancel::body(response, cancel.clone());
+            let mut file = fs::File::create(archive)?;
+            let mut digest = Sha256::new();
+            let mut received = 0;
+            let mut buffer = [0u8; 32 * 1024];
+            let mut last_update = Instant::now();
+            loop {
+                ensure_not_cancelled(&cancel)?;
+                let size = body.read(&mut buffer)?;
+                if size == 0 {
+                    break;
+                }
+                received += size as u64;
+                if received > MAX_DOWNLOAD {
+                    bail!(t!("errors.nodejs_download_limit"));
+                }
+                digest.update(&buffer[..size]);
+                file.write_all(&buffer[..size])?;
+                if last_update.elapsed() >= Duration::from_millis(100) {
+                    let fraction = length
+                        .filter(|size| *size > 0)
+                        .map_or(0.0, |size| received as f64 / size as f64)
+                        .min(1.0);
+                    status(update(
+                        t!("setup.downloading_nodejs", version = VERSION),
+                        format!("{:.1} MiB", received as f64 / 1048576.0),
+                        86.0 + fraction * 2.0,
+                    ));
+                    last_update = Instant::now();
                 }
             }
-        }
-
-        bail!("Unable to allocate a protected Node.js installer directory")
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-#[cfg(windows)]
-impl Drop for SecureNodeJsInstallerDir {
-    fn drop(&mut self) {
-        let installer = self.path.join("nodejs-lts.msi");
-        if let Err(error) = fs::remove_file(&installer) {
-            if error.kind() != io::ErrorKind::NotFound {
-                warn!(path = %installer.display(), "Unable to remove Node.js installer: {error}");
+            if format!("{:x}", digest.finalize()) != sha256 {
+                bail!(t!("errors.nodejs_digest_mismatch"));
             }
-        }
-        if let Err(error) = fs::remove_dir(&self.path) {
-            if error.kind() != io::ErrorKind::NotFound {
-                warn!(path = %self.path.display(), "Unable to remove Node.js installer directory: {error}");
+            file.sync_all()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                ensure_not_cancelled(&cancel)?;
+                warn!("Node.js download failed: {error:#}");
+                last_error = Some(error);
             }
         }
     }
+    Err(last_error.expect("at least one download source"))
 }
 
-#[cfg(windows)]
-pub fn is_nodejs_available() -> bool {
-    let Some(installation) = find_nodejs_installation() else {
-        return false;
-    };
-
-    if let Some(directory) = installation
-        .executable
-        .parent()
-        .filter(|directory| !directory.as_os_str().is_empty())
-    {
-        prepend_to_path(directory);
-    }
-    info!(
-        version = installation.version,
-        executable = %installation.executable.display(),
-        "Node.js runtime is available"
-    );
-    true
-}
-
-#[cfg(windows)]
-pub fn install_nodejs(
-    cancel_requested: &AtomicBool,
-    mut status_updater: impl FnMut(SplashUpdate),
+fn extract(
+    python: &Path,
+    archive: &Path,
+    destination: &Path,
+    directory: &str,
+    cancel: &AtomicBool,
 ) -> Result<()> {
-    if is_nodejs_available() {
-        return Ok(());
+    let mut command = Command::new(python);
+    command
+        .args(["-I", "-c", EXTRACT_SCRIPT])
+        .arg(archive)
+        .arg(destination)
+        .arg(directory);
+    crate::setup::isolate_python_child_environment(&mut command);
+    let status = crate::setup::run_status_command(&mut command, cancel)?;
+    if !status.success() {
+        bail!(t!(
+            "errors.nodejs_extract_exit",
+            status = status.to_string()
+        ));
     }
-    if cancel_requested.load(Ordering::SeqCst) {
-        bail!(t!("setup.cancel_cleaning"));
-    }
-
-    let installer = nodejs_installer_for_current_architecture()?;
-    validate_nodejs_installer_source(installer.url, installer.sha256)?;
-    let installer_dir = SecureNodeJsInstallerDir::new()?;
-    let installer_path = installer_dir.path().join("nodejs-lts.msi");
-
-    status_updater(SplashUpdate::loading(
-        t!("setup.installing_nodejs"),
-        t!("setup.downloading_nodejs", version = installer.version),
-        5,
-    ));
-    download_nodejs_installer(installer, &installer_path, cancel_requested)?;
-    verify_nodejs_installer(&installer_path, installer.sha256)?;
-
-    status_updater(SplashUpdate::loading(
-        t!("setup.installing_nodejs"),
-        t!("setup.installing_nodejs"),
-        7,
-    ));
-    run_nodejs_installer(&installer_path, cancel_requested, &mut status_updater)?;
-
-    if is_nodejs_available() {
-        return Ok(());
-    }
-
-    bail!(
-        "Node.js installer finished, but node.exe was not found in the current process environment"
-    );
+    Ok(())
 }
 
-#[cfg(windows)]
-fn find_nodejs_installation() -> Option<NodeJsInstallation> {
-    for executable in trusted_nodejs_candidates() {
-        if let Some(installation) = probe_node(&executable) {
-            return Some(installation);
+/// 完整下载、校验和探测后才替换目标；失败时恢复旧目录。
+fn activate(staged: &Path, target: &Path, backup: &Path) -> Result<()> {
+    let existed = target.exists();
+    if existed {
+        fs::rename(target, backup)?;
+    }
+    if let Err(error) = fs::rename(staged, target) {
+        if existed {
+            fs::rename(backup, target)
+                .with_context(|| t!("errors.nodejs_restore_failed").to_string())?;
+        }
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure(
+    root: &Path,
+    python: &Path,
+    cancel: Arc<AtomicBool>,
+    sources: &Preferences,
+    mut status: impl FnMut(SplashUpdate),
+) -> Result<PathBuf> {
+    ensure_with_candidates(
+        root,
+        python,
+        cancel,
+        sources,
+        &mut status,
+        system_candidates(),
+    )
+}
+
+fn ensure_with_candidates(
+    root: &Path,
+    python: &Path,
+    cancel: Arc<AtomicBool>,
+    sources: &Preferences,
+    mut status: impl FnMut(SplashUpdate),
+    candidates: Vec<PathBuf>,
+) -> Result<PathBuf> {
+    ensure_not_cancelled(&cancel)?;
+    status(update(
+        t!("setup.checking_nodejs"),
+        t!("setup.checking_nodejs"),
+        86.0,
+    ));
+    let distribution = distribution(env::consts::OS, env::consts::ARCH)?;
+    let target = distribution.target(root)?;
+    for bin in std::iter::once(bin_directory(&target)).chain(candidates) {
+        if usable(&bin, &cancel)? {
+            info!("Using Node.js from {}", bin.display());
+            return Ok(bin);
         }
     }
-    None
-}
-
-#[cfg(windows)]
-fn probe_node(executable: &Path) -> Option<NodeJsInstallation> {
-    if !executable.is_absolute() || !executable.is_file() {
-        return None;
+    let parent = target.parent().expect("Node.js tools directory");
+    fs::create_dir_all(parent)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".install-")
+        .tempdir_in(parent)?;
+    let archive = temporary.path().join(distribution.filename());
+    let urls =
+        sources
+            .nodejs_source
+            .urls(sources.download_source, VERSION, &distribution.filename());
+    let client = Client::builder()
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
+        .build()?;
+    status(update(
+        t!("setup.downloading_nodejs", version = VERSION),
+        t!("setup.downloading_nodejs", version = VERSION),
+        86.0,
+    ));
+    download(
+        &client,
+        &urls,
+        distribution.sha256,
+        &archive,
+        cancel.clone(),
+        &mut status,
+    )?;
+    status(update(
+        t!("setup.installing_nodejs"),
+        t!("setup.installing_nodejs"),
+        88.0,
+    ));
+    let extracted = temporary.path().join("extracted");
+    fs::create_dir(&extracted)?;
+    extract(
+        python,
+        &archive,
+        &extracted,
+        &distribution.directory(),
+        &cancel,
+    )?;
+    let staged = extracted.join(distribution.directory());
+    if !usable(&bin_directory(&staged), &cancel)? {
+        bail!(t!("errors.nodejs_runtime_invalid"));
     }
-    let output = Command::new(executable)
-        .arg("--version")
-        .create_no_window()
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    Some(NodeJsInstallation {
-        executable: executable.to_path_buf(),
-        version: parse_nodejs_version(&output.stdout)?,
-    })
-}
-
-#[cfg(windows)]
-fn trusted_nodejs_candidates() -> Vec<PathBuf> {
-    // This launcher is elevated, so never resolve node.exe from PATH or CWD.
-    // These machine-level registry entries are protected from standard users.
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(key) = windows_registry::LOCAL_MACHINE.open(NODEJS_REGISTRY_PATH) {
-        if let Ok(install_path) = key.get_string(NODEJS_INSTALL_PATH_VALUE) {
-            push_unique_absolute_path(
-                &mut candidates,
-                PathBuf::from(install_path).join("node.exe"),
+    ensure_not_cancelled(&cancel)?;
+    // 再次拒绝被替换成链接的目标路径；所有目录操作都位于独立工具目录内。
+    let target = distribution.target(root)?;
+    let backup = temporary.path().join("previous");
+    if let Err(error) = activate(&staged, &target, &backup) {
+        // 恢复旧目录也失败时保留备份，不能让 TempDir 清理掉原环境。
+        if backup.exists() {
+            let preserved = temporary.keep();
+            warn!(
+                "Preserved previous Node.js installation in {}",
+                preserved.display()
             );
         }
+        return Err(error);
     }
-
-    if let Ok(key) = windows_registry::LOCAL_MACHINE.open(WINDOWS_CURRENT_VERSION_REGISTRY_PATH) {
-        for value_name in [
-            "ProgramFilesDir",
-            "ProgramW6432Dir",
-            "ProgramFilesDir (x86)",
-        ] {
-            if let Ok(root) = key.get_string(value_name) {
-                push_unique_absolute_path(
-                    &mut candidates,
-                    PathBuf::from(root).join("nodejs").join("node.exe"),
-                );
-            }
-        }
-    }
-    candidates
-}
-
-#[cfg(windows)]
-fn push_unique_absolute_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if candidate.is_absolute()
-        && !paths
-            .iter()
-            .any(|existing| same_windows_path(existing, &candidate))
-    {
-        paths.push(candidate);
-    }
-}
-
-#[cfg(windows)]
-fn same_windows_path(left: &Path, right: &Path) -> bool {
-    left.as_os_str()
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-}
-
-#[cfg(windows)]
-fn prepend_to_path(directory: &Path) {
-    let existing_path = env::var_os("PATH").unwrap_or_default();
-    if env::split_paths(&existing_path).any(|existing| same_windows_path(&existing, directory)) {
-        return;
-    }
-
-    let mut paths = vec![directory.to_path_buf()];
-    paths.extend(env::split_paths(&existing_path));
-    if let Ok(path) = env::join_paths(paths) {
-        env::set_var("PATH", path);
-    }
-}
-
-#[cfg(windows)]
-fn parse_nodejs_version(output: &[u8]) -> Option<String> {
-    let value = std::str::from_utf8(output).ok()?.trim();
-    let version = value.strip_prefix('v')?;
-    let mut components = version.split('.');
-    let major = components.next()?.parse::<u32>().ok()?;
-    let minor = components.next()?.parse::<u32>().ok()?;
-    let patch = components.next()?.parse::<u32>().ok()?;
-    if major == 0 && minor == 0 && patch == 0 {
-        return None;
-    }
-    Some(value.to_owned())
-}
-
-#[cfg(windows)]
-fn nodejs_installer_for_current_architecture() -> Result<NodeJsInstaller> {
-    nodejs_installer_for_architecture(env::consts::ARCH)
-}
-
-#[cfg(windows)]
-fn nodejs_installer_for_architecture(architecture: &str) -> Result<NodeJsInstaller> {
-    match architecture {
-        "x86_64" => Ok(NodeJsInstaller {
-            version: NODEJS_LTS_VERSION,
-            url: NODEJS_LTS_X64_MSI_URL,
-            sha256: NODEJS_LTS_X64_MSI_SHA256,
-        }),
-        "aarch64" => Ok(NodeJsInstaller {
-            version: NODEJS_LTS_VERSION,
-            url: NODEJS_LTS_ARM64_MSI_URL,
-            sha256: NODEJS_LTS_ARM64_MSI_SHA256,
-        }),
-        "x86" => Ok(NodeJsInstaller {
-            version: NODEJS_LTS_X86_VERSION,
-            url: NODEJS_LTS_X86_MSI_URL,
-            sha256: NODEJS_LTS_X86_MSI_SHA256,
-        }),
-        other => bail!(
-            "Node.js automatic installation is not available for Windows architecture {other}"
-        ),
-    }
-}
-
-#[cfg(windows)]
-fn validate_nodejs_installer_source(url: &str, digest: &str) -> Result<()> {
-    if !url.starts_with("https://") {
-        bail!("Node.js installer URL must use HTTPS");
-    }
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("Node.js installer checksum is not a SHA-256 digest");
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn download_nodejs_installer(
-    installer: NodeJsInstaller,
-    part_path: &Path,
-    cancel_requested: &AtomicBool,
-) -> Result<()> {
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(15 * 60))
-        .build()
-        .context("build Node.js download client")?;
-    let mut response = client
-        .get(installer.url)
-        .send()
-        .context("download Node.js installer")?
-        .error_for_status()
-        .context("Node.js installer download returned an error status")?;
-    let mut destination = File::create(part_path).context("create Node.js installer part file")?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; NODEJS_DOWNLOAD_BUFFER_BYTES];
-
-    loop {
-        if cancel_requested.load(Ordering::SeqCst) {
-            bail!(t!("setup.cancel_cleaning"));
-        }
-        let read = response
-            .read(&mut buffer)
-            .context("read Node.js installer download")?;
-        if read == 0 {
-            break;
-        }
-        destination
-            .write_all(&buffer[..read])
-            .context("write Node.js installer part file")?;
-        digest.update(&buffer[..read]);
-    }
-    destination
-        .flush()
-        .context("flush Node.js installer part file")?;
-
-    let actual = format!("{:x}", digest.finalize());
-    if !actual.eq_ignore_ascii_case(installer.sha256) {
-        bail!(
-            "Node.js installer checksum mismatch: expected {}, got {}",
-            installer.sha256,
-            actual
-        );
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn verify_nodejs_installer(installer_path: &Path, expected_sha256: &str) -> Result<()> {
-    let mut source =
-        File::open(installer_path).context("open Node.js installer for verification")?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; NODEJS_DOWNLOAD_BUFFER_BYTES];
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .context("read Node.js installer for verification")?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-
-    let actual = format!("{:x}", digest.finalize());
-    if !actual.eq_ignore_ascii_case(expected_sha256) {
-        bail!(
-            "Node.js installer checksum mismatch after download: expected {}, got {}",
-            expected_sha256,
-            actual
-        );
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn run_nodejs_installer(
-    installer_path: &Path,
-    cancel_requested: &AtomicBool,
-    status_updater: &mut impl FnMut(SplashUpdate),
-) -> Result<()> {
-    let mut command = Command::new(system_msiexec_path()?);
-    command.args(nodejs_msi_args(installer_path));
-    let mut child = command
-        .create_no_window()
-        .spawn()
-        .context("start Node.js installer")?;
-    let mut wait_ticks = 0u16;
-
-    loop {
-        if cancel_requested.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(t!("setup.cancel_cleaning"));
-        }
-
-        if let Some(status) = child.try_wait().context("wait for Node.js installer")? {
-            if status.success() || status.code() == Some(3010) {
-                return Ok(());
-            }
-            bail!("Node.js installer exited with {status}");
-        }
-
-        wait_ticks = wait_ticks.saturating_add(1);
-        if wait_ticks >= 10 {
-            wait_ticks = 0;
-            status_updater(SplashUpdate::loading(
-                t!("setup.installing_nodejs"),
-                t!("setup.installing_nodejs"),
-                7,
-            ));
-        }
-        thread::sleep(NODEJS_INSTALLER_POLL_INTERVAL);
-    }
-}
-
-#[cfg(windows)]
-fn system_msiexec_path() -> Result<PathBuf> {
-    // GetSystemDirectoryW avoids PATH/CWD lookup for an elevated child process.
-    let msiexec = system_directory()?.join("msiexec.exe");
-    if msiexec.is_file() {
-        return Ok(msiexec);
-    }
-    bail!("Windows Installer was not found at {}", msiexec.display());
-}
-
-#[cfg(windows)]
-fn windows_temp_directory() -> Result<PathBuf> {
-    let system_directory = system_directory()?;
-    let windows_directory = system_directory
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Unable to locate the Windows directory"))?;
-    let temp_directory = windows_directory.join("Temp");
-    if temp_directory.is_dir() {
-        return Ok(temp_directory);
-    }
-    bail!(
-        "Windows temporary directory was not found at {}",
-        temp_directory.display()
+    info!(
+        "Installed portable Node.js {VERSION} at {}",
+        target.display()
     );
+    Ok(bin_directory(&target))
 }
 
-#[cfg(windows)]
-fn system_directory() -> Result<PathBuf> {
-    let mut buffer = vec![0u16; 260];
-    loop {
-        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-        if length == 0 {
-            bail!("Unable to locate the Windows system directory");
-        }
-        let length = length as usize;
-        if length < buffer.len() {
-            return Ok(PathBuf::from(OsString::from_wide(&buffer[..length])));
-        }
-        buffer.resize(length.saturating_add(1), 0);
-    }
-}
-
-#[cfg(windows)]
-fn create_secure_directory(path: &Path) -> io::Result<()> {
-    let path = wide_null(path.as_os_str());
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    let mut sddl = NODEJS_SECURE_INSTALLER_DIRECTORY_SDDL
-        .encode_utf16()
-        .collect::<Vec<_>>();
-    sddl.push(0);
-
-    let converted = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            u32::from(SDDL_REVISION_1),
-            &mut descriptor,
-            ptr::null_mut(),
-        )
-    };
-    if converted == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor,
-        bInheritHandle: 0,
-    };
-    let created = unsafe { CreateDirectoryW(path.as_ptr(), &mut attributes) };
-    unsafe {
-        LocalFree(descriptor);
-    }
-    if created == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-fn wide_null(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(windows)]
-fn secure_directory_suffix() -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut bytes = [0u8; NODEJS_SECURE_INSTALLER_DIRECTORY_RANDOM_BYTES];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let mut suffix = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        suffix.push(HEX[(byte >> 4) as usize] as char);
-        suffix.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    suffix
-}
-
-#[cfg(windows)]
-fn nodejs_msi_args(installer_path: &Path) -> Vec<std::ffi::OsString> {
-    vec![
-        "/i".into(),
-        installer_path.as_os_str().to_owned(),
-        "/qn".into(),
-        "/norestart".into(),
-    ]
-}
-
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     #[test]
-    fn test_nodejs_installer_source_requires_https_and_sha256() {
-        let digest = "a".repeat(64);
-
-        assert!(
-            validate_nodejs_installer_source("https://nodejs.org/dist/node.msi", &digest).is_ok()
-        );
-        assert!(
-            validate_nodejs_installer_source("http://nodejs.org/dist/node.msi", &digest).is_err()
-        );
-        assert!(
-            validate_nodejs_installer_source("https://nodejs.org/dist/node.msi", "bad").is_err()
-        );
-    }
-
-    #[test]
-    fn test_nodejs_version_parser_rejects_non_node_output() {
-        assert_eq!(
-            parse_nodejs_version(b"v24.21.0\r\n"),
-            Some("v24.21.0".to_owned())
-        );
-        assert_eq!(parse_nodejs_version(b"24.21.0\n"), None);
-        assert_eq!(parse_nodejs_version(b"node v24.21.0\n"), None);
-        assert_eq!(parse_nodejs_version(b"v0.0.0\n"), None);
-    }
-
-    #[test]
-    fn test_nodejs_installer_matches_windows_architecture() {
-        let x64 = nodejs_installer_for_architecture("x86_64").expect("x64 installer");
-        assert_eq!(x64.version, NODEJS_LTS_VERSION);
-        assert_eq!(x64.url, NODEJS_LTS_X64_MSI_URL);
-        assert_eq!(x64.sha256, NODEJS_LTS_X64_MSI_SHA256);
-
-        let arm64 = nodejs_installer_for_architecture("aarch64").expect("arm64 installer");
-        assert_eq!(arm64.version, NODEJS_LTS_VERSION);
-        assert_eq!(arm64.url, NODEJS_LTS_ARM64_MSI_URL);
-        assert_eq!(arm64.sha256, NODEJS_LTS_ARM64_MSI_SHA256);
-
-        let x86 = nodejs_installer_for_architecture("x86").expect("x86 installer");
-        assert_eq!(x86.version, NODEJS_LTS_X86_VERSION);
-        assert_eq!(x86.url, NODEJS_LTS_X86_MSI_URL);
-        assert_eq!(x86.sha256, NODEJS_LTS_X86_MSI_SHA256);
-
-        assert!(nodejs_installer_for_architecture("mips").is_err());
-    }
-
-    #[test]
-    fn test_nodejs_probe_never_resolves_a_bare_executable_name() {
-        assert!(probe_node(Path::new("node")).is_none());
-    }
-
-    #[test]
-    fn test_secure_installer_directory_name_uses_full_random_hex() {
-        let suffix = secure_directory_suffix();
-
-        assert_eq!(
-            suffix.len(),
-            NODEJS_SECURE_INSTALLER_DIRECTORY_RANDOM_BYTES * 2
-        );
-        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn test_secure_installer_directory_dacl_is_protected() {
-        assert!(NODEJS_SECURE_INSTALLER_DIRECTORY_SDDL.starts_with("D:P"));
-        assert!(NODEJS_SECURE_INSTALLER_DIRECTORY_SDDL.contains("WDWO;;;OW"));
-        assert!(NODEJS_SECURE_INSTALLER_DIRECTORY_SDDL.contains("FA;;;SY"));
-        assert!(NODEJS_SECURE_INSTALLER_DIRECTORY_SDDL.contains("FA;;;BA"));
-    }
-
-    #[test]
-    fn test_secure_installer_directory_dacl_is_valid_sddl() {
-        let mut sddl = NODEJS_SECURE_INSTALLER_DIRECTORY_SDDL
-            .encode_utf16()
-            .collect::<Vec<_>>();
-        sddl.push(0);
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-
-        let converted = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                u32::from(SDDL_REVISION_1),
-                &mut descriptor,
-                ptr::null_mut(),
-            )
-        };
-        assert_ne!(converted, 0, "{}", io::Error::last_os_error());
-        unsafe {
-            LocalFree(descriptor);
+    fn supported_distributions_have_pinned_digests_and_native_archives() {
+        for os in ["windows", "macos", "linux"] {
+            for arch in ["x86_64", "aarch64"] {
+                let package = distribution(os, arch).unwrap();
+                assert_eq!(package.sha256.len(), 64);
+                assert!(package.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                assert!(package.filename().ends_with(if os == "windows" {
+                    ".zip"
+                } else {
+                    ".tar.gz"
+                }));
+            }
+        }
+        assert!(distribution("linux", "unknown").is_err());
+        // Vite's minimum: reject old 22.x and 20.x, allow 22.12+ and 24.x.
+        for (text, supported) in [
+            ("v22.11.0", false),
+            ("v22.12.0", true),
+            ("v20.18.0", false),
+            ("v24.22.2\r\n", true),
+        ] {
+            assert_eq!(
+                parse_version(text).is_some_and(|version| version >= MIN_VERSION),
+                supported
+            );
+        }
+        for text in ["node v24.22.2", "v24.22.2-extra", "v24.22", "v24.22.2.0"] {
+            assert!(parse_version(text).is_none());
         }
     }
 
     #[test]
-    fn test_nodejs_msi_arguments_are_silent_and_do_not_restart() {
-        let args = nodejs_msi_args(Path::new(r"C:\temp\node.msi"));
-        let values = args
-            .iter()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+    fn runtime_path_is_only_added_to_the_child_and_preserves_other_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("node bin");
+        let other = root.path().join("other");
+        let original = env::var_os("PATH");
+        let mut command = Command::new("python");
+        command.env("PATH", env::join_paths([&other, &bin]).unwrap());
+        configure_command(&mut command, &bin).unwrap();
+        let path = command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(env::split_paths(path).collect::<Vec<_>>(), vec![bin, other]);
+        assert_eq!(env::var_os("PATH"), original);
+    }
 
-        assert_eq!(values, ["/i", r"C:\temp\node.msi", "/qn", "/norestart"]);
+    #[test]
+    fn download_retries_corrupt_payload_and_only_accepts_the_pinned_digest() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let payload = b"verified archive";
+        let server = thread::spawn(move || {
+            for bytes in [b"corrupt archive".as_slice(), payload.as_slice()] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 4096];
+                stream.read(&mut request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                )
+                .unwrap();
+                stream.write_all(bytes).unwrap();
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("node.zip");
+        let urls = vec![
+            format!("http://{address}/first"),
+            format!("http://{address}/fallback"),
+        ];
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        download(
+            &client,
+            &urls,
+            &format!("{:x}", Sha256::digest(payload)),
+            &archive,
+            Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(fs::read(archive).unwrap(), payload);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_activation_restores_the_previous_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("runtime");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), "old runtime").unwrap();
+        assert!(activate(
+            &root.path().join("missing"),
+            &target,
+            &root.path().join("backup")
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_to_string(target.join("keep")).unwrap(),
+            "old runtime"
+        );
+        assert!(!root.path().join("backup").exists());
+    }
+
+    #[test]
+    fn cancelled_setup_does_not_create_or_remove_runtime_files() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("keep"), "environment").unwrap();
+        assert!(ensure_with_candidates(
+            root.path(),
+            Path::new("unused"),
+            Arc::new(AtomicBool::new(true)),
+            &Preferences::default(),
+            |_| {},
+            vec![]
+        )
+        .is_err());
+        assert!(!root.path().join(".azurpilot").exists());
+        assert_eq!(
+            fs::read_to_string(root.path().join("keep")).unwrap(),
+            "environment"
+        );
+    }
+
+    #[test]
+    #[ignore = "downloads official Node.js; set AZURPILOT_NODEJS_TEST_PYTHON to Python 3.14"]
+    fn real_nodejs_portable_install_and_reuse() {
+        use crate::window_util::CreateNoWindow as _;
+        let python =
+            PathBuf::from(env::var_os("AZURPILOT_NODEJS_TEST_PYTHON").expect("Python path"));
+        let root = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sources = Preferences {
+            download_source: crate::sources::DownloadSource::Github,
+            nodejs_source: crate::sources::NodejsSource::Official,
+            ..Default::default()
+        };
+        let bin = ensure_with_candidates(
+            root.path(),
+            &python,
+            cancel.clone(),
+            &sources,
+            |_| {},
+            vec![],
+        )
+        .unwrap();
+        assert!(bin.starts_with(root.path()));
+        let node = bin.join(if cfg!(windows) { "node.exe" } else { "node" });
+        let cli = if cfg!(windows) {
+            bin.join("node_modules/npm/bin/npm-cli.js")
+        } else {
+            bin.join("../lib/node_modules/npm/bin/npm-cli.js")
+        };
+        // The same child PATH used by deploy.app must expose both node and npm.
+        let mut command = Command::new(&node);
+        command.arg(&cli).arg("--version").stdout(Stdio::null());
+        configure_command(&mut command, &bin).unwrap();
+        assert!(crate::setup::run_status_command(&mut command, &cancel)
+            .unwrap()
+            .success());
+        let mut command = Command::new(&python);
+        command.args(["-I", "-c", "import subprocess; subprocess.run(['node', '--version'], check=True); import shutil; assert shutil.which('npm')"]);
+        configure_command(&mut command, &bin).unwrap();
+        assert!(command.create_no_window().status().unwrap().success());
+        let mut downloaded_again = false;
+        let reused = ensure_with_candidates(
+            root.path(),
+            &python,
+            cancel,
+            &sources,
+            |status| {
+                downloaded_again |= status.title.contains(VERSION);
+            },
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(bin, reused);
+        assert!(!downloaded_again);
+    }
+
+    #[test]
+    #[ignore = "downloads Node.js from both mirror sites to verify pinned digests"]
+    fn real_nodejs_mirrors_match_pinned_digest() {
+        use crate::sources::{DownloadSource, NodejsSource};
+        let package = distribution(env::consts::OS, env::consts::ARCH).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join(package.filename());
+        let client = Client::builder()
+            .https_only(true)
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(180))
+            .build()
+            .unwrap();
+        for source in [NodejsSource::Npmmirror, NodejsSource::Nju] {
+            let urls = source.urls(DownloadSource::Github, VERSION, &package.filename());
+            // 限制为所选镜像，保证测试不能借助官方回退掩盖镜像地址错误。
+            download(
+                &client,
+                &urls[..1],
+                package.sha256,
+                &archive,
+                Arc::new(AtomicBool::new(false)),
+                &mut |_| {},
+            )
+            .unwrap();
+        }
     }
 }

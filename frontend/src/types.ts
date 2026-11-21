@@ -1,0 +1,102 @@
+export type Phase =
+  | "checking"
+  | "update_available"
+  | "updating"
+  | "idle"
+  | "deploying"
+  | "starting"
+  | "running"
+  | "stopping"
+  | "repairing"
+  | "cancelling"
+  | "error";
+export type Operation = "check" | "update" | "deploy" | "start" | "stop" | "repair";
+export interface Progress {
+  title: string;
+  detail: string;
+  subtitle: string;
+  progress: number;
+  uv_progress?: { progress: number; detail: string; task_id: number };
+  is_error: boolean;
+  terminal: boolean;
+  sequence: number;
+}
+export interface CrashReport {
+  code: number | null;
+  /** 人话一句话崩溃原因。 */
+  summary: string;
+  /** 原始日志/Traceback，可展开查看。 */
+  detail: string;
+}
+export interface Snapshot {
+  sequence: number;
+  task_id: number;
+  phase: Phase;
+  operation: Operation | null;
+  update_version: string | null;
+  /** 更新清单中的更新说明，缺省为 null。 */
+  update_notes: string | null;
+  update_checked: boolean;
+  backend_running: boolean;
+  deployment_required: boolean;
+  progress: Progress | null;
+  error: string | null;
+  error_code: number | null;
+  error_hint: string | null;
+  /** 后端崩溃报告（启动失败/运行期意外退出时填充）。 */
+  crash: CrashReport | null;
+  connection_error: string | null;
+  message: string | null;
+  can_start: boolean;
+  can_deploy: boolean;
+  can_repair: boolean;
+  can_stop: boolean;
+  can_check: boolean;
+  can_update: boolean;
+  can_cancel: boolean;
+}
+export interface Context {
+  locale: string;
+  version: string;
+  platform: string;
+}
+export interface LauncherSettings {
+  launchOnStartup: boolean;
+  autoStartService: boolean;
+  keepWebviewOnTray: boolean;
+  reducedMotion: boolean;
+  disableBackgroundVideo: boolean;
+  preventSleep: boolean;
+  audioEnabled: boolean;
+  skipUpdate: boolean;
+  updateChannel: "stable" | "canary";
+  updateSource: "auto" | "official" | "github" | "cloudflare" | "cnb" | "gitcode";
+  language: string | null;
+  accentColor: string | null;
+  customBackgroundImage: string | null;
+  customBackgroundVideo: string | null;
+  downloadSource: "auto" | "cnb" | "github";
+  pythonSource: "auto" | "nju" | "ustc" | "npmmirror" | "aliyun" | "cnb" | "astral";
+  nodejsSource: "auto" | "official" | "npmmirror" | "nju";
+  pypiSource: "auto" | "pypi" | "tsinghua" | "ustc" | "aliyun" | "tencent" | "huawei" | "nju";
+}
+export const busy = (s: Snapshot) =>
+  [
+    "checking",
+    "updating",
+    "deploying",
+    "starting",
+    "stopping",
+    "repairing",
+    "cancelling",
+  ].includes(s.phase);
+export function acceptSnapshot(
+  current: Snapshot | null,
+  next: Snapshot,
+): Snapshot | null {
+  return Number.isSafeInteger(next.sequence) &&
+    next.sequence >= 0 &&
+    (!current || next.sequence > current.sequence)
+    ? next
+    : current;
+}

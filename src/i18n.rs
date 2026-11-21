@@ -1,37 +1,40 @@
-const LOCALE_OVERRIDE_ARGS: &[&str] = &["--lang", "--locale", "/lang", "/locale"];
+//! 国际化模块：确定界面语言并设置全局 locale。
+//!
+//! 语言选择按系统 locale 自动检测，未命中时回退到 `en`；用户在设置中
+//! 保存的语言偏好由 [`apply_override`] 覆盖。翻译文件位于 `locales/*.yml`
+//! （基准语言为 `zh-CN`），代码中通过 `t!("module.key")` 宏取词；本模块在
+//! 应用启动最早阶段调用 [`init`] 完成设置，之后所有模块共享同一 locale。
 
-/// 初始化 i18n：检测系统语言（或启动参数覆盖），设置全局 locale
+/// 初始化 i18n：检测系统语言并设置全局 locale。
+///
+/// 结果写入 rust-i18n 的全局 locale，并记录日志便于排查。
 pub fn init() {
-    let locale = locale_from_args().unwrap_or_else(detect_locale);
+    let locale = detect_locale();
     rust_i18n::set_locale(&locale);
     tracing::info!("i18n locale set to: {}", locale);
 }
 
-/// 检查启动参数中是否有 --lang / --locale 覆盖
-fn locale_from_args() -> Option<String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    for (i, arg) in args.iter().enumerate() {
-        let lower = arg.to_ascii_lowercase();
-        if LOCALE_OVERRIDE_ARGS.iter().any(|flag| lower == *flag) {
-            if let Some(value) = args.get(i + 1) {
-                return Some(normalize_locale(value));
-            }
-        }
-        // 支持 --lang=zh-CN 形式
-        if let Some(value) = lower.strip_prefix("--lang=") {
-            return Some(normalize_locale(value));
-        }
-        if let Some(value) = lower.strip_prefix("--locale=") {
-            return Some(normalize_locale(value));
-        }
-    }
-    None
+/// 应用设置里的语言覆盖（None 表示跟随系统检测）。
+///
+/// 供设置模块在用户切换界面语言、以及启动时恢复已保存语言时调用，
+/// 保证 Rust 侧消息与前端界面语言一致。
+pub fn apply_override(language: Option<&str>) {
+    let locale = language.map(normalize_locale).unwrap_or_else(detect_locale);
+    rust_i18n::set_locale(&locale);
+    tracing::info!("i18n locale overridden to: {}", locale);
 }
 
-/// 将用户输入的语言代码标准化为支持的 locale
+/// 将用户输入的语言代码标准化为支持的 locale。
+///
+/// 支持的取值：`zh-CN`（含所有 `zh*` 前缀，除非明确指向繁体）、
+/// `zh-TW`（含 `tw` / `hk` / `hant` / `zht` 变体）、`ja`（含 `jp`）、
+/// `en`（含 `us`）。无法识别的输入告警后回退 `en`，保证界面
+/// 永远有可用的语言。
 fn normalize_locale(input: &str) -> String {
     let lower = input.to_ascii_lowercase();
-    if lower.starts_with("zh") {
+    if lower == "zh-neko" || lower.contains("neko") {
+        "zh-neko".to_string()
+    } else if lower.starts_with("zh") {
         if lower.contains("tw")
             || lower.contains("hk")
             || lower.contains("hant")
@@ -53,9 +56,14 @@ fn normalize_locale(input: &str) -> String {
     }
 }
 
-/// 检测系统语言，返回对应的 locale 字符串
+/// 检测系统语言，返回对应的 locale 字符串。
+///
+/// 通过 sys-locale crate 读取系统 locale（如 `zh_CN.UTF-8`、
+/// `ja-JP`），映射规则与 [`normalize_locale`] 一致；读取失败时
+/// 视为 `en`。
 fn detect_locale() -> String {
     let sys_locale = sys_locale::get_locale().unwrap_or_else(|| "en".to_string());
+    tracing::info!("Detected system locale: {}", sys_locale);
 
     let lang = sys_locale.to_lowercase();
     if lang.starts_with("zh") {
@@ -68,5 +76,22 @@ fn detect_locale() -> String {
         "ja".to_string()
     } else {
         "en".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_locale() {
+        assert_eq!(normalize_locale("zh-neko"), "zh-neko");
+        assert_eq!(normalize_locale("neko"), "zh-neko");
+        assert_eq!(normalize_locale("ZH-NEKO"), "zh-neko");
+        assert_eq!(normalize_locale("zh-CN"), "zh-CN");
+        assert_eq!(normalize_locale("zh-TW"), "zh-TW");
+        assert_eq!(normalize_locale("ja"), "ja");
+        assert_eq!(normalize_locale("en"), "en");
+        assert_eq!(normalize_locale("unknown"), "en");
     }
 }

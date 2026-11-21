@@ -1,0 +1,1538 @@
+//! 启动器状态机及任务调度。所有环境操作必须先在同一把锁下取得任务槽位。
+#[cfg(any(windows, target_os = "macos"))]
+use crate::tray_icon_for_platform;
+use crate::{
+    backend::{ManagedBackend, WebuiLaunchConfig},
+    crash_report::{self, CrashReport},
+    initialize_logging,
+    launcher_control::{start_launcher_channel, ChannelHandler, LauncherChannel},
+    notify::NotificationClickHandler,
+    progress::{self, SplashUpdate},
+    setup::{self, get_deploy_config, setup_azurpilot_repo, setup_environment},
+    start_minimized_arg_present, time_bomb_expiration_message, updater,
+    windows::*,
+};
+// window_util 仅在 Windows 控制台探测中使用；拆出按平台导入避免 Linux 告警。
+#[cfg(windows)]
+use crate::window_util;
+use anyhow::{bail, Context, Result};
+use rust_i18n::t;
+use serde::Serialize;
+use std::sync::Condvar;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+use tauri::Emitter;
+#[cfg(any(windows, target_os = "macos"))]
+use tauri::tray::TrayIconBuilder;
+use tauri::{Manager, State, WebviewWindow};
+use tauri_plugin_dialog::DialogExt;
+use tracing::{debug, info, warn};
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Phase {
+    Checking,
+    UpdateAvailable,
+    Updating,
+    Idle,
+    Deploying,
+    Starting,
+    Running,
+    Stopping,
+    Repairing,
+    Cancelling,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Operation {
+    Check,
+    Update,
+    Deploy,
+    Start,
+    Stop,
+    Repair,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct Snapshot {
+    pub sequence: u64,
+    pub task_id: u64,
+    pub phase: Phase,
+    pub operation: Option<Operation>,
+    pub update_version: Option<String>,
+    /// 更新清单中的更新说明；随版本信息一并展示在首页。
+    pub update_notes: Option<String>,
+    pub update_checked: bool,
+    pub backend_running: bool,
+    pub deployment_required: bool,
+    pub progress: Option<SplashUpdate>,
+    pub error: Option<String>,
+    pub error_code: Option<i32>,
+    /// 面向用户的友好提示：网络类错误时给出“请检查互联网连接”等可行动建议。
+    /// 原始技术细节仍在 `error`，供日志卡片与排障使用。
+    pub error_hint: Option<String>,
+    /// 后端崩溃报告（启动失败 / 运行期意外退出时填充），供独立崩溃报告窗口展示。
+    pub crash: Option<CrashReport>,
+    pub connection_error: Option<String>,
+    pub message: Option<String>,
+    pub can_start: bool,
+    pub can_deploy: bool,
+    pub can_repair: bool,
+    pub can_stop: bool,
+    pub can_check: bool,
+    pub can_update: bool,
+    pub can_cancel: bool,
+}
+
+struct Model {
+    view: Snapshot,
+    active: bool,
+    cancel: Arc<AtomicBool>,
+    committing: bool,
+    exiting: bool,
+    dirty: bool,
+    progress: progress::ProgressState,
+    update: Option<updater::AvailableUpdate>,
+}
+
+impl Model {
+    fn new() -> Self {
+        Self {
+            view: Snapshot {
+                sequence: 1,
+                task_id: 0,
+                phase: Phase::Idle,
+                operation: None,
+                update_version: None,
+                update_notes: None,
+                update_checked: false,
+                backend_running: false,
+                deployment_required: true,
+                progress: None,
+                error: None,
+                error_code: None,
+                error_hint: None,
+                crash: None,
+                connection_error: None,
+                message: None,
+                can_start: false,
+                can_deploy: false,
+                can_repair: false,
+                can_stop: false,
+                can_check: true,
+                can_update: false,
+                can_cancel: false,
+            },
+            active: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            committing: false,
+            exiting: false,
+            dirty: true,
+            progress: Default::default(),
+            update: None,
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        let mut view = self.view.clone();
+        let free = !self.active && !self.exiting;
+        let ready = free && view.update_checked && self.update.is_none() && !view.backend_running;
+        view.can_start = ready && !view.deployment_required;
+        view.can_deploy = ready && view.deployment_required;
+        view.can_repair = ready;
+        view.can_stop = free && view.backend_running;
+        view.can_check = free && !view.backend_running;
+        view.can_update = free && self.update.is_some();
+        view.can_cancel = self.active && !self.committing && !self.exiting;
+        view
+    }
+
+    fn touch(&mut self) {
+        self.view.sequence += 1;
+        self.dirty = true;
+    }
+
+    fn begin(&mut self, operation: Operation) -> Result<(u64, Arc<AtomicBool>)> {
+        let view = self.snapshot();
+        let allowed = match operation {
+            Operation::Check => view.can_check,
+            Operation::Update => view.can_update,
+            Operation::Start => view.can_start,
+            Operation::Deploy => view.can_deploy,
+            Operation::Repair => view.can_repair,
+            Operation::Stop => view.can_stop,
+        };
+        if !allowed {
+            bail!(t!("launcher.busy"));
+        }
+        self.active = true;
+        self.committing = false;
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.progress = Default::default();
+        self.view.task_id += 1;
+        self.view.phase = match operation {
+            Operation::Check => Phase::Checking,
+            Operation::Update => Phase::Updating,
+            Operation::Start => Phase::Starting,
+            Operation::Deploy => Phase::Deploying,
+            Operation::Stop => Phase::Stopping,
+            Operation::Repair => Phase::Repairing,
+        };
+        self.view.operation = Some(operation);
+        self.view.progress = None;
+        self.view.error = None;
+        self.view.error_code = None;
+        self.view.message = None;
+        if operation == Operation::Check {
+            self.view.update_checked = false;
+        }
+        self.touch();
+        Ok((self.view.task_id, self.cancel.clone()))
+    }
+
+    fn accepts(&self, task: u64) -> bool {
+        self.active
+            && self.view.task_id == task
+            && !self.cancel.load(Ordering::SeqCst)
+            && !self.exiting
+    }
+
+    fn publish(&mut self, task: u64, update: SplashUpdate) {
+        if self.accepts(task) && self.progress.accept(update) {
+            self.view.progress = self.progress.latest.clone();
+            self.touch();
+        }
+    }
+
+    fn finish(&mut self, task: u64, result: Result<()>) {
+        if self.view.task_id != task {
+            return;
+        }
+        self.active = false;
+        self.committing = false;
+        if !self.exiting {
+            match result {
+                Ok(()) => {
+                    self.view.phase = if self.view.backend_running {
+                        Phase::Running
+                    } else if self.update.is_some() {
+                        Phase::UpdateAvailable
+                    } else {
+                        Phase::Idle
+                    };
+                    self.view.error = None;
+                    self.view.error_code = None;
+                    self.view.error_hint = None;
+                    self.view.crash = None;
+                    self.view.progress = None;
+                }
+                Err(error) => {
+                    self.view.phase = Phase::Error;
+                    let (text, code) = split_error_code(&format!("{error:#}"));
+                    self.view.error_hint = network_error_hint(&text);
+                    // 带分类退出码的启动/部署失败属于后端崩溃，采集报告并弹窗。
+                    // 分类码之外的普通任务错误（如 check/update 的网络失败）不弹崩溃窗。
+                    if code.is_some_and(is_crash_code) {
+                        self.view.crash = Some(crash_report::collect(code, &text));
+                    }
+                    self.view.error = Some(text);
+                    self.view.error_code = code;
+                }
+            }
+        }
+        self.touch();
+    }
+}
+
+struct Session {
+    task: u64,
+    streams: Vec<thread::JoinHandle<()>>,
+    channel: Arc<LauncherChannel>,
+}
+
+struct NativeChannelHandler {
+    app: tauri::AppHandle,
+    on_click: NotificationClickHandler,
+}
+
+impl ChannelHandler for NativeChannelHandler {
+    fn autostart(&self, enabled: Option<bool>) -> Result<serde_json::Value> {
+        let state = match enabled {
+            Some(enabled) => crate::autostart::set_enabled(enabled)?,
+            None => crate::autostart::query()?,
+        };
+        Ok(serde_json::json!({"supported":state.supported,"enabled":state.enabled}))
+    }
+
+    fn notification(&self, data: serde_json::Value) -> Result<()> {
+        crate::notify::display(&self.app, data, &self.on_click)
+    }
+}
+
+pub(crate) struct Launcher {
+    app: tauri::AppHandle,
+    model: Mutex<Model>,
+    changed: Condvar,
+    backend: Mutex<Option<(u64, ManagedBackend)>>,
+    session: Mutex<Option<Session>>,
+    allow_exit: Arc<AtomicBool>,
+    recreate: Arc<AtomicBool>,
+    /// 已通知过的更新版本号，避免轮询期间对同一版本重复发通知。
+    notified_update: Mutex<Option<String>>,
+    port: u16,
+    skip_update: bool,
+    minimized: bool,
+}
+
+impl Launcher {
+    fn lock_model(&self) -> std::sync::MutexGuard<'_, Model> {
+        self.model.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn lock_backend(&self) -> std::sync::MutexGuard<'_, Option<(u64, ManagedBackend)>> {
+        self.backend.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn lock_session(&self) -> std::sync::MutexGuard<'_, Option<Session>> {
+        self.session.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// main 窗口重建标记：托盘“显示/隐藏”走恢复路径时需要。
+    pub(crate) fn recreate(&self) -> Arc<AtomicBool> {
+        self.recreate.clone()
+    }
+
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        self.lock_model().snapshot()
+    }
+
+    fn change(&self, change: impl FnOnce(&mut Model)) {
+        let mut model = self.lock_model();
+        change(&mut model);
+        self.changed.notify_all();
+    }
+
+    fn publish(&self, task: u64, update: SplashUpdate) {
+        self.change(|m| m.publish(task, update));
+    }
+
+    fn dispatch(self: &Arc<Self>) {
+        let controller = self.clone();
+        thread::spawn(move || {
+            let mut sent = Instant::now() - progress::UPDATE_INTERVAL;
+            loop {
+                let mut model = controller.lock_model();
+                while !model.dirty && !controller.allow_exit.load(Ordering::SeqCst) {
+                    model = controller
+                        .changed
+                        .wait(model)
+                        .unwrap_or_else(|p| p.into_inner());
+                }
+                if controller.allow_exit.load(Ordering::SeqCst) {
+                    return;
+                }
+                let urgent = !model.active
+                    || matches!(model.view.phase, Phase::Cancelling | Phase::Error)
+                    || model
+                        .view
+                        .progress
+                        .as_ref()
+                        .is_some_and(|p| p.is_error || p.progress >= 100.0);
+                let delay = progress::UPDATE_INTERVAL.saturating_sub(sent.elapsed());
+                if !urgent && !delay.is_zero() {
+                    let _ = controller
+                        .changed
+                        .wait_timeout(model, delay)
+                        .unwrap_or_else(|p| p.into_inner());
+                    continue;
+                }
+                model.dirty = false;
+                let snapshot = model.snapshot();
+                drop(model);
+                let _ = controller
+                    .app
+                    .emit_to("launcher", "launcher://state", &snapshot);
+                if let Some(window) = controller.app.get_webview_window("main") {
+                    if is_local_page(&controller.app, &window) {
+                        let _ = window.emit("launcher://state", &snapshot);
+                    }
+                }
+                sent = Instant::now();
+            }
+        });
+    }
+
+    fn begin(&self, operation: Operation) -> Result<(u64, Arc<AtomicBool>)> {
+        let result = self.lock_model().begin(operation);
+        self.changed.notify_all();
+        result
+    }
+
+    fn finish(&self, task: u64, result: Result<()>) {
+        let failed = result.is_err();
+        let deployment_required =
+            crate::components::deployment_required(&setup::azurpilot_repo_dir());
+        self.change(|m| {
+            m.view.deployment_required = deployment_required;
+            m.finish(task, result);
+        });
+        if failed && !self.lock_model().exiting {
+            // 带分类退出码的崩溃已写入 Snapshot.crash，弹出独立崩溃报告窗口。
+            if self.lock_model().view.crash.is_some() {
+                crate::native_dialog::show_crash_dialog(&self.app);
+            }
+            let _ = show_launcher_home(&self.app);
+        }
+    }
+
+    fn check(self: &Arc<Self>, auto_start: bool) -> Result<()> {
+        let (task, cancel) = self.begin(Operation::Check)?;
+        let controller = self.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                let deployment_required =
+                    crate::components::deployment_required(&setup::azurpilot_repo_dir());
+                let store = controller
+                    .app
+                    .state::<Arc<crate::settings::Store>>();
+                let settings = store.get();
+                let update = if controller.skip_update || settings.skip_update {
+                    info!("Launcher update check skipped by user setting");
+                    None
+                } else {
+                    // 检查期间用户可能刚打开跳过开关：此时即使检查失败也放行启动。
+                    match updater::check_update(&cancel, settings.update_channel) {
+                        Ok(update) => update,
+                        Err(error) if store.get().skip_update => {
+                            warn!("Update check failed while updates are skipped: {error:#}");
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                // 写回模型前再确认一次，避免检查期间切换设置导致门禁状态过期。
+                let update = if !controller.skip_update && store.get().skip_update {
+                    None
+                } else {
+                    update
+                };
+                let mut model = controller.model.lock().unwrap();
+                if !model.accepts(task) {
+                    bail!(t!("launcher.cancelled"));
+                }
+                model.view.deployment_required = deployment_required;
+                model.view.update_version = update.as_ref().map(|u| u.version.clone());
+                model.view.update_notes = update.as_ref().and_then(|u| u.notes.clone());
+                model.update = update;
+                model.view.update_checked = true;
+                Ok(())
+            })();
+            let success = result.is_ok();
+            controller.finish(task, result);
+            let view = controller.snapshot();
+            // 发现新版本且与上次通知的版本不同：发原生通知提醒（点击唤起
+            // 首页，由用户在主按钮上手动确认更新）。
+            if let Some(version) = view.update_version.clone() {
+                let mut notified = controller.notified_update.lock().unwrap();
+                if notified.as_deref() != Some(version.as_str()) {
+                    *notified = Some(version.clone());
+                    drop(notified);
+                    let click_app = controller.app.clone();
+                    let click: crate::notify::NotificationClickHandler = Arc::new(move || {
+                        let _ = crate::windows::show_launcher_home(&click_app);
+                    });
+                    let data = serde_json::json!({
+                        "content": t!("launcher_update.notify_body", version = version),
+                        "updata": "true",
+                    });
+                    if let Err(error) = crate::notify::display(&controller.app, data, &click) {
+                        warn!("Failed to show update notification: {error:#}");
+                    }
+                }
+            }
+            if auto_start && success && view.can_start {
+                let _ = controller.start();
+            } else if view.update_version.is_some() || view.deployment_required {
+                let _ = show_launcher_home(&controller.app);
+            }
+        });
+        Ok(())
+    }
+
+    /// 供设置切换与定期轮询触发的静默检查：任务互斥时跳过本轮。
+    pub(crate) fn request_update_check(self: &Arc<Self>) {
+        if let Err(error) = self.check(false) {
+            debug!("Skipped periodic update check: {error:#}");
+        }
+    }
+
+    /// 切换“跳过更新”后立即同步启动门禁，不必等下一轮检查。
+    pub(crate) fn sync_skip_update(&self, skip: bool) {
+        self.change(|model| {
+            if model.active {
+                return;
+            }
+            if skip {
+                model.update = None;
+                model.view.update_version = None;
+                model.view.update_notes = None;
+                model.view.update_checked = true;
+            } else {
+                model.view.update_checked = false;
+            }
+            model.touch();
+        });
+    }
+
+    fn install_update(self: &Arc<Self>) -> Result<()> {
+        let (task, cancel) = self.begin(Operation::Update)?;
+        let controller = self.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                let update = controller
+                    .model
+                    .lock()
+                    .unwrap()
+                    .update
+                    .clone()
+                    .context("missing update")?;
+                updater::install_update(
+                    &update,
+                    cancel,
+                    |u| controller.publish(task, u),
+                    || {
+                        // Cancellation and the atomic replacement handoff share the state lock.
+                        let mut model = controller.model.lock().unwrap();
+                        if !model.accepts(task) {
+                            bail!(t!("launcher.cancelled"));
+                        }
+                        model.committing = true;
+                        model.touch();
+                        controller.changed.notify_all();
+                        Ok(())
+                    },
+                    controller
+                        .app
+                        .state::<Arc<crate::settings::Store>>()
+                        .get()
+                        .update_source,
+                )?;
+                controller.allow_exit.store(true, Ordering::SeqCst);
+                controller.changed.notify_all();
+                controller.app.exit(0);
+                Ok(())
+            })();
+            controller.finish(task, result);
+        });
+        Ok(())
+    }
+
+    fn deploy(self: &Arc<Self>) -> Result<()> {
+        let (task, cancel) = self.begin(Operation::Deploy)?;
+        let controller = self.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                crate::components::deploy(
+                    &setup::azurpilot_repo_dir(),
+                    &mut |mut update: SplashUpdate| {
+                        update.progress =
+                            ((update.progress - 5.0) / 19.0 * 100.0).clamp(0.0, 100.0);
+                        controller.publish(task, update);
+                    },
+                    cancel.clone(),
+                    controller.skip_update,
+                    &controller
+                        .app
+                        .state::<Arc<crate::settings::Store>>()
+                        .get()
+                        .sources,
+                )?;
+                ensure_not_cancelled(&cancel)?;
+                controller.change(|model| {
+                    if model.accepts(task) {
+                        model.view.message = Some(t!("launcher.deploy_done").to_string());
+                    }
+                });
+                Ok(())
+            })();
+            controller.finish(task, result);
+        });
+        Ok(())
+    }
+
+    fn start(self: &Arc<Self>) -> Result<()> {
+        let deployment_required =
+            crate::components::deployment_required(&setup::azurpilot_repo_dir());
+        self.change(|model| {
+            model.view.deployment_required = deployment_required;
+            model.touch();
+        });
+        let (task, cancel) = self.begin(Operation::Start)?;
+        let controller = self.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                setup_azurpilot_repo(
+                    |u| controller.publish(task, u),
+                    cancel.clone(),
+                    controller.skip_update,
+                    &controller
+                        .app
+                        .state::<Arc<crate::settings::Store>>()
+                        .get()
+                        .sources,
+                )?;
+                ensure_not_cancelled(&cancel)?;
+                let mut config =
+                    WebuiLaunchConfig::from_deploy_config(get_deploy_config().as_ref());
+                config.port = controller.port;
+                controller.publish(
+                    task,
+                    SplashUpdate::loading(t!("splash.starting"), t!("splash.starting_backend"), 97),
+                );
+                let backend = ManagedBackend::new_cancellable(&config, &cancel)?;
+                // Prevent cancellation racing with adoption of a newly spawned backend.
+                {
+                    let mut model = controller.model.lock().unwrap();
+                    if !model.accepts(task) {
+                        bail!(t!("launcher.cancelled"));
+                    }
+                    *controller.backend.lock().unwrap() = Some((task, backend));
+                    model.view.backend_running = true;
+                    model.view.connection_error = None;
+                }
+                controller.start_session(task);
+                Ok(())
+            })();
+            let success = result.is_ok();
+            controller.finish(task, result);
+            if success && !controller.model.lock().unwrap().exiting {
+                if controller.minimized {
+                    #[cfg(target_os = "linux")]
+                    hide_launcher_home(&controller.app);
+                } else {
+                    controller.open_webui();
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn repair(self: &Arc<Self>) -> Result<()> {
+        let (task, cancel) = self.begin(Operation::Repair)?;
+        let controller = self.clone();
+        thread::spawn(move || {
+            let result = (|| {
+                setup::repair_environment(
+                    |u| controller.publish(task, u),
+                    cancel,
+                    &controller
+                        .app
+                        .state::<Arc<crate::settings::Store>>()
+                        .get()
+                        .sources,
+                )?;
+                controller.change(|m| {
+                    if m.accepts(task) {
+                        m.view.message = Some(t!("launcher.repair_done").to_string());
+                    }
+                });
+                Ok(())
+            })();
+            controller.finish(task, result);
+        });
+        Ok(())
+    }
+
+    fn start_session(self: &Arc<Self>, task: u64) {
+        // 重新启动时关闭上一次的崩溃报告窗口。
+        let _ = crate::native_dialog::close_crash_dialog(&self.app);
+        let stop = Arc::new(AtomicBool::new(false));
+        let on_click: NotificationClickHandler = {
+            let controller = self.clone();
+            let stop = stop.clone();
+            Arc::new(move || {
+                if !stop.load(Ordering::SeqCst) {
+                    controller.open_webui();
+                }
+            })
+        };
+        let handler = Arc::new(NativeChannelHandler {
+            app: self.app.clone(),
+            on_click,
+        });
+        let (channel, worker) = start_launcher_channel(
+            self.port,
+            crate::launcher_trust_secret().to_owned(),
+            stop.clone(),
+            handler,
+        );
+        let streams = vec![worker];
+        *self.lock_session() = Some(Session {
+            task,
+            streams,
+            channel,
+        });
+        let controller = self.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(250));
+                let exit_status = {
+                    let mut backend = controller.lock_backend();
+                    backend
+                        .as_mut()
+                        .filter(|(id, _)| *id == task)
+                        .and_then(|(_, b)| b.try_wait().ok().flatten())
+                };
+                if let Some(status) = exit_status {
+                    if !stop.load(Ordering::SeqCst) {
+                        controller.unexpected_exit(task, status.code());
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn unexpected_exit(&self, task: u64, exit_code: Option<i32>) {
+        // Claim this session before joining its streams. A simultaneous stop wins safely.
+        {
+            let mut model = self.lock_model();
+            if model.active
+                || model.exiting
+                || !model.view.backend_running
+                || model.view.task_id != task
+            {
+                return;
+            }
+            model.active = true;
+            model.view.phase = Phase::Stopping;
+            model.touch();
+        }
+        let _ = self.stop_backend();
+        let fallback = t!("launcher.backend_exited").to_string();
+        let report = crash_report::collect(exit_code, &fallback);
+        self.change(|m| {
+            m.active = false;
+            m.view.backend_running = false;
+            m.view.phase = Phase::Error;
+            m.view.operation = Some(Operation::Start);
+            m.view.error = Some(fallback.clone());
+            m.view.error_code = exit_code;
+            m.view.connection_error = m.view.error.clone();
+            m.view.crash = Some(report);
+            m.touch();
+        });
+        if let Some(window) = self.app.get_webview_window("main") {
+            let _ = navigate_to_backend_error(&window, self.port, &fallback);
+        }
+        // 独立崩溃报告窗口（PCL2 风格：人话摘要 + 可展开详情 + 下载日志）。
+        crate::native_dialog::show_crash_dialog(&self.app);
+        let _ = show_launcher_home(&self.app);
+
+        // 后端意外退出（如熔断退出码 76 等）时发送系统通知；点击通知唤起启动器主页
+        let click_app = self.app.clone();
+        let click: crate::notify::NotificationClickHandler = Arc::new(move || {
+            let _ = show_launcher_home(&click_app);
+        });
+        let data = serde_json::json!({
+            "title": t!("launcher.backend_exited").to_string(),
+            "content": t!("launcher.backend_exited_notify").to_string(),
+        });
+        if let Err(error) = crate::notify::display(&self.app, data, &click) {
+            warn!("Failed to show backend exit notification: {error:#}");
+        }
+    }
+
+    fn stop_backend(&self) -> Result<()> {
+        let session = self.lock_session().take();
+        if let Some(session) = &session {
+            session.channel.close();
+        }
+        let result = if let Some((_, mut backend)) = self.lock_backend().take() {
+            backend.terminate().map(|_| ())
+        } else {
+            Ok(())
+        };
+        if let Some(session) = session {
+            for stream in session.streams {
+                let _ = stream.join();
+            }
+            debug!("Stopped backend session {}", session.task);
+        }
+        result
+    }
+
+    fn stop(self: &Arc<Self>) -> Result<()> {
+        let (task, _) = self.begin(Operation::Stop)?;
+        if let Some(window) = self.app.get_webview_window("main") {
+            let _ = window.destroy();
+        }
+        let controller = self.clone();
+        thread::spawn(move || {
+            let result = controller.stop_backend();
+            controller.change(|m| {
+                m.view.backend_running = false;
+                m.view.connection_error = None;
+                m.view.message = Some(t!("launcher.stopped").to_string());
+            });
+            controller.finish(task, result);
+        });
+        Ok(())
+    }
+
+    pub(crate) fn connection_error(&self, error: String) {
+        self.change(|m| {
+            m.view.connection_error = Some(error);
+            m.touch();
+        });
+    }
+
+    pub(crate) fn open_webui(&self) {
+        let view = self.snapshot();
+        if !view.backend_running || view.phase != Phase::Running {
+            let _ = show_launcher_home(&self.app);
+            return;
+        }
+        restore_main_window_from_any_thread(self.app.clone(), self.port, self.recreate.clone());
+    }
+
+    pub(crate) fn webui_url(&self) -> String {
+        let channel = self
+            .session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|session| session.channel.clone());
+        crate::webui_navigate_url(self.port, channel)
+    }
+
+    pub(crate) fn request_close(self: &Arc<Self>) {
+        let view = self.snapshot();
+        if view.can_cancel {
+            let _ = show_launcher_home(&self.app);
+            let _ = self
+                .app
+                .emit_to("launcher", "launcher://close-requested", ());
+        } else if view.backend_running {
+            hide_launcher_home(&self.app);
+        } else if !self.lock_model().active {
+            let _ = self.exit();
+        }
+    }
+
+    /// 取消当前任务但保持启动器运行：置位任务取消标志并切换到 Cancelling
+    /// 阶段，任务流程在下一个取消检查点中止，随后以 `launcher.cancelled`
+    /// 错误进入错误态；启动器窗口保留，可直接重试或退出。
+    ///
+    /// # Errors
+    /// 任务处于提交（committing）阶段时返回 `launcher.busy`；其余情况返回
+    /// `Ok`，包括当前没有活动任务（幂等空操作）。
+    pub(crate) fn cancel_task(self: &Arc<Self>) -> Result<()> {
+        let mut model = self.lock_model();
+        if model.committing {
+            bail!(t!("launcher.busy"));
+        }
+        if !model.active || model.exiting {
+            return Ok(());
+        }
+        model.cancel.store(true, Ordering::SeqCst);
+        model.view.phase = Phase::Cancelling;
+        model.touch();
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn exit(self: &Arc<Self>) -> Result<()> {
+        {
+            let mut model = self.lock_model();
+            if model.committing {
+                bail!(t!("launcher.busy"));
+            }
+            if model.exiting {
+                return Ok(());
+            }
+            model.exiting = true;
+            model.cancel.store(true, Ordering::SeqCst);
+            model.view.phase = Phase::Cancelling;
+            model.touch();
+            self.changed.notify_all();
+        }
+        let controller = self.clone();
+        thread::spawn(move || {
+            let wait_start = Instant::now();
+            let timeout = Duration::from_secs(5);
+            let mut model = controller.lock_model();
+            while model.active {
+                let elapsed = wait_start.elapsed();
+                if elapsed >= timeout {
+                    warn!(
+                        "Active task did not complete within {:?}, forcing shutdown",
+                        timeout
+                    );
+                    break;
+                }
+                let remaining = timeout - elapsed;
+                let (next_model, wait_res) = controller
+                    .changed
+                    .wait_timeout(model, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                model = next_model;
+                if wait_res.timed_out() {
+                    warn!("Wait for active task timed out, forcing shutdown");
+                    break;
+                }
+            }
+            drop(model);
+            if let Err(error) = controller.stop_backend() {
+                warn!("Backend shutdown: {error:#}");
+            }
+            controller.allow_exit.store(true, Ordering::SeqCst);
+            controller.changed.notify_all();
+            controller.app.exit(0);
+        });
+        Ok(())
+    }
+}
+
+pub(crate) fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::SeqCst) {
+        bail!(t!("launcher.cancelled"));
+    }
+    Ok(())
+}
+
+/// 从错误文本提取 `AZURPILOT_ERROR:{code}:` 标记：返回（剥掉标记的文本, 错误码）。
+/// Python 侧（AzurPilot deploy/installer.py）以该前缀携带分类退出码。
+pub(crate) fn split_error_code(text: &str) -> (String, Option<i32>) {
+    const MARK: &str = "AZURPILOT_ERROR:";
+    let Some(pos) = text.find(MARK) else {
+        return (text.to_string(), None);
+    };
+    let rest = &text[pos + MARK.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let Ok(code) = digits.parse::<i32>() else {
+        return (text.to_string(), None);
+    };
+    // 剥掉标记本身与其后的消息分隔冒号，保留下一段可读文本。
+    let mut clean = String::new();
+    clean.push_str(&text[..pos]);
+    let after = &rest[digits.len()..];
+    clean.push_str(after.strip_prefix(':').unwrap_or(after));
+    (clean.trim().to_string(), Some(code))
+}
+
+/// 是否属于「后端崩溃」分类退出码：deploy ErrorCodes（1、10-13）与 gui EXIT_*（70-78）。
+/// 只有这些码才弹独立崩溃报告窗口；check/update 的普通错误不带此类码。
+fn is_crash_code(code: i32) -> bool {
+    code == 1 || (10..=13).contains(&code) || (70..=78).contains(&code)
+}
+
+/// 从错误文本识别网络类错误，返回面向用户的可行动提示；非网络错误返回 None。
+///
+/// 错误来源混杂：既有 i18n 中文（如 `network.deadline` = "网络请求超时"），
+/// 也有 reqwest/anyhow 的英文串（如 `HTTP status server error (500)`、
+/// `primary unavailable`、`dns error`）。这里按关键词归类，给出统一提示，
+/// 原始技术串仍由 `error` 字段保留在日志卡片中供排障。
+///
+/// 本地后端不可达（`errors.backend_unreachable`）不属于互联网问题，排除在外，
+/// 它由独立的连接错误窗口处理。
+pub(crate) fn network_error_hint(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+
+    // 本地后端错误走独立的连接错误窗口，不套用互联网提示。
+    if lower.contains("本地后端") || lower.contains("local backend") {
+        return None;
+    }
+
+    const NETWORK_MARKERS: &[&str] = &[
+        "http", "https", "tls", "ssl", "dns", "tcp", "quic",
+        "connection", "connect ", "connected", "refused", "unreachable",
+        "timeout", "timed out", "deadline", "download", "download failed",
+        "primary unavailable", "network", "socket", "certificate",
+        "redirect", "response", "checksum", "sha256", "digest mismatch",
+        "网络", "连接", "下载", "超时", "校验", "无法检查", "无法获取组件清单",
+    ];
+    if !NETWORK_MARKERS.iter().any(|m| lower.contains(m)) {
+        return None;
+    }
+
+    let hint = if lower.contains("checksum")
+        || lower.contains("sha256")
+        || lower.contains("digest mismatch")
+        || lower.contains("校验")
+    {
+        t!("errors.network_checksum_hint")
+    } else if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("deadline")
+        || lower.contains("超时")
+    {
+        t!("errors.network_timeout_hint")
+    } else if lower.contains("http status")
+        || lower.contains("returned http")
+        || (lower.contains("http ") && lower.contains("error"))
+    {
+        t!("errors.network_http_hint")
+    } else {
+        t!("errors.network_hint")
+    };
+    Some(hint.to_string())
+}
+
+pub(crate) fn is_local_page(app: &tauri::AppHandle, window: &WebviewWindow) -> bool {
+    let Ok(url) = window.url() else {
+        return false;
+    };
+    let Ok(local) = local_page_url(app, "") else {
+        return false;
+    };
+    // 只比对 origin：自定义协议域名下全部是启动器内嵌资产，不存在外部
+    // 页面；不再限定路径形式（macOS WKWebView 可能对路径做规范化变体，
+    // 曾导致本地页面被误判为非本地而拒绝 IPC）。
+    same_local_origin(&url, &local)
+}
+
+// url::Origin treats custom schemes as opaque; compare explicit components so
+// tauri://localhost also authorizes correctly on macOS and Linux.
+fn same_local_origin(url: &tauri::Url, local: &tauri::Url) -> bool {
+    url.scheme() == local.scheme()
+        && url.host_str() == local.host_str()
+        && url.port() == local.port()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+pub(crate) fn authorize(window: &WebviewWindow, home_only: bool) -> Result<(), String> {
+    // 来源由 permissions/launcher.toml 和 capabilities/*.json 交给 Tauri
+    // 按本次 IPC 的调用来源校验；这里仅保留窗口标签的防御性检查。
+    // 不再读取 WebView 当前 URL，避免 WKWebView 的 URL 查询差异误拒本地调用。
+    // tray_menu 弹窗与 crash 崩溃报告窗口只做只读调用（读语言、状态/设置）。
+    let label = window.label();
+    let read_only_aux = label == crate::tray_menu::TRAY_MENU_LABEL || label == "crash";
+    if label != "launcher" && (home_only || (label != "main" && !read_only_aux)) {
+        warn!(
+            "Rejected IPC from window '{}': home_only={}",
+            label, home_only
+        );
+        return Err(t!("launcher.forbidden").to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn launcher_context(window: WebviewWindow) -> Result<serde_json::Value, String> {
+    authorize(&window, false)?;
+    info!("React page context ready: {}", window.label());
+    Ok(
+        serde_json::json!({ "locale": rust_i18n::locale().to_string(), "version": env!("CARGO_PKG_VERSION"), "platform": std::env::consts::OS }),
+    )
+}
+#[tauri::command]
+fn launcher_snapshot(
+    window: WebviewWindow,
+    controller: State<'_, Arc<Launcher>>,
+) -> Result<Snapshot, String> {
+    authorize(&window, false)?;
+    debug!("React page snapshot ready: {}", window.label());
+    Ok(controller.snapshot())
+}
+
+macro_rules! action_command {
+    ($name:ident, $method:ident) => {
+        #[tauri::command]
+        fn $name(
+            window: WebviewWindow,
+            controller: State<'_, Arc<Launcher>>,
+        ) -> Result<(), String> {
+            authorize(&window, true)?;
+            controller.$method().map_err(|e| format!("{e:#}"))
+        }
+    };
+}
+action_command!(launcher_start, start);
+action_command!(launcher_deploy, deploy);
+action_command!(launcher_stop, stop);
+action_command!(launcher_repair, repair);
+action_command!(launcher_install_update, install_update);
+action_command!(launcher_cancel_and_exit, exit);
+action_command!(launcher_cancel, cancel_task);
+#[tauri::command]
+fn launcher_check_update(
+    window: WebviewWindow,
+    controller: State<'_, Arc<Launcher>>,
+) -> Result<(), String> {
+    authorize(&window, true)?;
+    controller.check(false).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn launcher_open_webui(
+    window: WebviewWindow,
+    controller: State<'_, Arc<Launcher>>,
+) -> Result<(), String> {
+    authorize(&window, true)?;
+    controller.open_webui();
+    Ok(())
+}
+#[tauri::command]
+fn launcher_show_home(window: WebviewWindow) -> Result<(), String> {
+    authorize(&window, false)?;
+    show_launcher_home(window.app_handle()).map_err(|e| e.to_string())?;
+    if window.label() == "main" {
+        let _ = window.destroy();
+    }
+    Ok(())
+}
+#[tauri::command]
+fn launcher_back(
+    window: WebviewWindow,
+    controller: State<'_, Arc<Launcher>>,
+) -> Result<(), String> {
+    authorize(&window, true)?;
+    controller.change(|m| {
+        if !m.active && m.view.update_checked && m.update.is_none() {
+            m.view.phase = if m.view.backend_running {
+                Phase::Running
+            } else {
+                Phase::Idle
+            };
+            m.view.error = None;
+            m.view.progress = None;
+            m.touch();
+        }
+    });
+    Ok(())
+}
+
+pub(crate) fn run() -> Result<()> {
+    #[cfg(windows)]
+    {
+        if updater::try_apply_launcher_update_from_args()? {
+            return Ok(());
+        }
+        unsafe {
+            use winapi::um::wincon::{AttachConsole, ATTACH_PARENT_PROCESS};
+            if std::env::var_os(updater::LAUNCHER_UPDATE_NO_CONSOLE_ENV).is_some() {
+                std::env::remove_var(updater::LAUNCHER_UPDATE_NO_CONSOLE_ENV);
+            } else {
+                window_util::HAS_CONSOLE
+                    .store(AttachConsole(ATTACH_PARENT_PROCESS) != 0, Ordering::Relaxed);
+            }
+        }
+    }
+    setup_environment()?;
+    let _log_guard = initialize_logging()?;
+    crate::i18n::init();
+    let allow_exit = Arc::new(AtomicBool::new(false));
+    let allow_for_setup = allow_exit.clone();
+    let allow_for_run = allow_exit.clone();
+    let port = WebuiLaunchConfig::from_deploy_config(get_deploy_config().as_ref()).port;
+    let preview_deploy =
+        cfg!(debug_assertions) && std::env::args().any(|arg| arg == "--preview-deploy");
+    let minimized = start_minimized_arg_present();
+    let auto_start = minimized || std::env::var_os("AZURPILOT_RESUME_START").is_some();
+    let settings_store = Arc::new(crate::settings::Store::new());
+    // 启动时恢复已保存的语言覆盖，Rust 侧消息与前端一致。
+    crate::i18n::apply_override(settings_store.get().language.as_deref());
+    std::env::remove_var("AZURPILOT_RESUME_START");
+    info!("Starting React launcher {}", env!("CARGO_PKG_VERSION"));
+    tauri::Builder::default()
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                if let Some(window) = webview.app_handle().get_webview_window(webview.label()) {
+                    sync_webview_visibility(&window);
+                }
+            }
+        })
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_single_instance::init(move |app, _, _| {
+            let Some(controller) = app.try_state::<Arc<Launcher>>() else { return; };
+            if controller.snapshot().backend_running { controller.open_webui(); }
+            else { let _ = show_launcher_home(app); }
+        }))
+        .invoke_handler(tauri::generate_handler![
+            launcher_context, launcher_snapshot, launcher_start, launcher_deploy, launcher_stop, launcher_repair,
+            launcher_check_update, launcher_install_update, launcher_open_webui, launcher_show_home,
+            launcher_cancel_and_exit, launcher_cancel, launcher_back,
+            crate::save_as, crate::download_today_gui_log, crate::download_today_launcher_log, crate::retry_backend_connection,
+            crate::download_log_archive, crate::prompt_log_archive_path,
+            crate::settings::settings_get, crate::settings::settings_set,
+            crate::settings::pick_background_file,
+            crate::window_hide, crate::window_minimize, crate::window_toggle_maximize, crate::window_close, crate::window_exit_application,
+            crate::window_start_dragging, crate::window_is_maximized, crate::window_fit_content,
+            crate::tray_menu::tray_menu_action, crate::tray_menu::tray_menu_hide,
+            crate::tray_menu::tray_instances
+        ])
+        .setup(move |app| {
+            let controller = Arc::new(Launcher { app: app.handle().clone(), model: Mutex::new(Model::new()), changed: Condvar::new(),
+                backend: Mutex::new(None), session: Mutex::new(None), allow_exit: allow_for_setup.clone(),
+                recreate: Arc::new(AtomicBool::new(false)), notified_update: Mutex::new(None), port, skip_update: preview_deploy, minimized });
+            app.manage(controller.clone());
+            app.manage(settings_store.clone());
+            let auto_start = auto_start || settings_store.auto_start_service();
+            // 启动时恢复“阻止计算机自动睡眠”电源锁；失败仅记录，不阻塞启动。
+            if settings_store.get().prevent_sleep {
+                if let Err(error) = crate::power::set_prevent_sleep(true) {
+                    warn!("Failed to restore prevent-sleep lock: {error:#}");
+                }
+            }
+            match time_bomb_expiration_message() {
+                Ok(Some(message)) => {
+                    allow_for_setup.store(true, Ordering::SeqCst);
+                    let handle = app.handle().clone();
+                    app.dialog().message(message).title(t!("dialog.test_ended")).show(move |_| handle.exit(0));
+                    return Ok(());
+                }
+                Err(error) => warn!("Unable to verify test expiration: {error:#}"),
+                _ => {}
+            }
+            create_tray(app)?;
+            controller.dispatch();
+            // 每 10 分钟静默检查一次更新：发现新版本时首页主按钮变为
+            // “更新”，并经原生通知提醒一次（同一版本只提醒一遍）。
+            let poller = controller.clone();
+            thread::spawn(move || {
+                while !poller.allow_exit.load(Ordering::SeqCst) {
+                    for _ in 0..(10 * 60) {
+                        if poller.allow_exit.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                    if poller.allow_exit.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    poller.request_update_check();
+                }
+            });
+            if !minimized { show_launcher_home(app.handle())?; }
+            if preview_deploy {
+                controller.change(|model| { model.view.update_checked = true; model.view.deployment_required = true; model.touch(); });
+                if let Some(window) = app.get_webview_window("launcher") { window.set_title("AzurPilot Debug")?; }
+                show_launcher_home(app.handle())?;
+            } else { controller.check(auto_start)?; }
+            let ctrl_controller = controller.clone();
+            ctrlc::set_handler(move || { let _ = ctrl_controller.exit(); })?;
+            Ok(())
+        })
+        .build(tauri::generate_context!())?
+        .run(move |app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if !allow_for_run.load(Ordering::SeqCst) {
+                    api.prevent_exit();
+                    let controller = app.state::<Arc<Launcher>>();
+                    controller.request_close();
+                }
+            }
+            tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => {
+                if allow_for_run.load(Ordering::SeqCst) { return; }
+                api.prevent_close();
+                if label == "launcher" { app.state::<Arc<Launcher>>().request_close(); }
+                else if label == "main" {
+                    #[cfg(windows)]
+                    if let Some(window) = app.get_webview_window("main") {
+                        if window.eval("if (window.__AZURPILOT_OPEN_CLOSE_PROMPT) window.__AZURPILOT_OPEN_CLOSE_PROMPT();").is_err() { minimize_main_window_to_tray(app); }
+                    }
+                    #[cfg(not(windows))]
+                    minimize_main_window_to_tray(app);
+                }
+            }
+            tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } => {
+                if label == "connection" {
+                    // 独立连接弹窗被关闭：若 WebUI 尚未恢复（重试成功关闭时
+                    // main 已导航回 WebUI，快照为 Running），把 main 收进托盘，
+                    // 避免遗留一个只有背景的错误页窗口。
+                    let view = app.state::<Arc<Launcher>>().snapshot();
+                    if !view.backend_running || view.phase != Phase::Running {
+                        minimize_main_window_to_tray(app);
+                    }
+                }
+            }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Focused(false),
+                ..
+            } if label == crate::tray_menu::TRAY_MENU_LABEL => {
+                // 托盘自绘菜单弹窗失焦即收起，对齐原生菜单交互。
+                crate::tray_menu::hide_tray_menu_window(app);
+            }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Focused(_),
+                ..
+            } => {
+                if let Some(window) = app.get_webview_window(&label) {
+                    sync_webview_visibility(&window);
+                }
+            }
+            tauri::RunEvent::Exit => {
+                if let Some(controller) = app.try_state::<Arc<Launcher>>() { let _ = controller.stop_backend(); }
+            }
+            _ => {}
+        });
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn create_tray(app: &mut tauri::App) -> Result<()> {
+    // Windows 的原生托盘菜单是 Win32 HMENU，由系统绘制、无法自定义样式：
+    // 右键改由 tray_menu 自绘弹窗接管，不再挂原生菜单；macOS 保留系统菜单。
+    #[cfg(target_os = "macos")]
+    let menu = crate::tray_menu::native_menu(app.handle())?;
+    #[cfg(windows)]
+    app.manage(crate::tray_menu::TrayMenuState::default());
+    let builder = TrayIconBuilder::with_id("main-tray")
+        .icon(tray_icon_for_platform())
+        .tooltip("AzurPilot")
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
+        .on_menu_event(|app, event| {
+            crate::tray_menu::handle_tray_menu_action(app, event.id().as_ref());
+        })
+        .on_tray_icon_event(|tray, event| {
+            #[cfg(windows)]
+            match event {
+                // 左键/双击：后端运行中直接开 WebUI，否则回首页。
+                tauri::tray::TrayIconEvent::Click {
+                    button: tauri::tray::MouseButton::Left,
+                    button_state: tauri::tray::MouseButtonState::Up,
+                    ..
+                }
+                | tauri::tray::TrayIconEvent::DoubleClick {
+                    button: tauri::tray::MouseButton::Left,
+                    ..
+                } => {
+                    let controller = tray.app_handle().state::<Arc<Launcher>>();
+                    if controller.snapshot().backend_running {
+                        controller.open_webui();
+                    } else {
+                        let _ = show_launcher_home(tray.app_handle());
+                    }
+                }
+                // 右键：弹出（或收起）自绘菜单弹窗。
+                tauri::tray::TrayIconEvent::Click {
+                    button: tauri::tray::MouseButton::Right,
+                    button_state: tauri::tray::MouseButtonState::Up,
+                    position,
+                    ..
+                } => {
+                    if let Err(error) =
+                        crate::tray_menu::show_tray_menu_popup(tray.app_handle(), position)
+                    {
+                        warn!("Failed to show tray menu popup: {error:#}");
+                    }
+                }
+                _ => {}
+            }
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::tray::TrayIconEvent::Click { .. }) {
+                crate::tray_menu::refresh_tray_menu(tray.app_handle());
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let _ = (tray, event);
+        });
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(&menu);
+    builder.build(app)?;
+    // 预建隐藏弹窗：首次右键免 WebView2 初始化延迟。
+    #[cfg(windows)]
+    if let Err(error) = crate::tray_menu::ensure_tray_menu_window(app.handle()) {
+        warn!("Failed to prebuild tray menu window: {error:#}");
+    }
+    Ok(())
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn create_tray(_app: &mut tauri::App) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+
+    #[test]
+    fn split_error_code_extracts_marker_and_cleans_text() {
+        let (text, code) = split_error_code("AZURPILOT_ERROR:11: git fetch origin master 重试穷尽");
+        assert_eq!(code, Some(11));
+        assert_eq!(text, "git fetch origin master 重试穷尽");
+        let (text, code) =
+            split_error_code("前置说明 AZURPILOT_ERROR:13: uv sync 失败（端口 22267）");
+        assert_eq!(code, Some(13));
+        assert!(text.starts_with("前置说明"));
+        assert!(text.contains("uv sync 失败"));
+        let (text, code) = split_error_code("AZURPILOT_ERROR:bad: 无数字");
+        assert_eq!(code, None);
+        assert!(text.contains("AZURPILOT_ERROR"));
+        let (text, code) = split_error_code("普通错误，无标记");
+        assert_eq!(code, None);
+        assert_eq!(text, "普通错误，无标记");
+    }
+
+    #[test]
+    fn network_error_hint_classifies_network_failures() {
+        // 互联网类错误都应有友好提示。
+        for text in [
+            "launcher update download returned HTTP 503",
+            "HTTP status server error (500 Internal Server Error)",
+            "网络请求超时",
+            "dns error: failed to lookup address",
+            "primary unavailable",
+            "launcher update sha256 mismatch: expected a, got b",
+            "下载组件失败：连接被重置",
+        ] {
+            assert!(
+                network_error_hint(text).is_some(),
+                "expected a network hint for: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_error_hint_skips_local_backend_and_plain_errors() {
+        // 本地后端错误走独立连接窗口，不应套用互联网提示。
+        assert!(network_error_hint("无法连接本地后端 http://127.0.0.1:22267").is_none());
+        // 普通业务错误不应误判为网络问题。
+        assert!(network_error_hint("文件路径无效").is_none());
+        assert!(network_error_hint("任务已取消").is_none());
+        assert!(network_error_hint("").is_none());
+    }
+
+    #[test]
+    fn local_origin_check_supports_custom_schemes_and_rejects_other_origins() {
+        for base in [
+            "tauri://localhost/index.html",
+            "http://tauri.localhost/index.html",
+            "http://127.0.0.1:1420/index.html",
+        ] {
+            let url = tauri::Url::parse(base).unwrap();
+            assert!(same_local_origin(&url, &tauri::Url::parse(base).unwrap()));
+            // 同 origin 下路径差异不影响判定：is_local_page 不再限定路径，
+            // 以兼容 WKWebView 对本地资源 URL 的规范化变体。
+            let variant = url.join("some/route").unwrap();
+            assert!(same_local_origin(&variant, &url));
+            assert!(!same_local_origin(
+                &tauri::Url::parse("https://example.com/index.html").unwrap(),
+                &url
+            ));
+        }
+    }
+    fn ready() -> Model {
+        let mut m = Model::new();
+        m.view.update_checked = true;
+        m.view.deployment_required = false;
+        m
+    }
+    #[test]
+    fn tasks_are_mutually_exclusive_and_running_repair_is_forbidden() {
+        let mut m = ready();
+        let (task, _) = m.begin(Operation::Start).unwrap();
+        assert!(m.begin(Operation::Repair).is_err());
+        m.view.backend_running = true;
+        m.finish(task, Ok(()));
+        assert!(m.begin(Operation::Repair).is_err());
+        assert!(m.begin(Operation::Start).is_err());
+        let (stop, _) = m.begin(Operation::Stop).unwrap();
+        m.view.backend_running = false;
+        m.finish(stop, Ok(()));
+        assert!(m.begin(Operation::Repair).is_ok());
+    }
+    #[test]
+    fn deployment_finishes_idle_and_requires_a_separate_start() {
+        let mut model = ready();
+        model.view.deployment_required = true;
+        assert!(model.snapshot().can_deploy);
+        assert!(!model.snapshot().can_start);
+        assert!(model.begin(Operation::Start).is_err());
+        let (task, _) = model.begin(Operation::Deploy).unwrap();
+        assert_eq!(model.view.phase, Phase::Deploying);
+        assert!(model.snapshot().can_cancel);
+        assert!(model.begin(Operation::Start).is_err());
+        model.view.deployment_required = false;
+        model.finish(task, Ok(()));
+        assert_eq!(model.view.phase, Phase::Idle);
+        assert!(!model.view.backend_running);
+        assert!(model.snapshot().can_start);
+        assert!(!model.snapshot().can_deploy);
+        assert_eq!(model.view.operation, Some(Operation::Deploy));
+        model.begin(Operation::Start).unwrap();
+        assert_eq!(model.view.phase, Phase::Starting);
+    }
+    #[test]
+    fn update_gate_and_failed_checks_cannot_be_bypassed() {
+        let mut m = Model::new();
+        assert!(m.begin(Operation::Start).is_err());
+        assert!(m.begin(Operation::Deploy).is_err());
+        let (task, _) = m.begin(Operation::Check).unwrap();
+        m.finish(task, Err(anyhow!("offline")));
+        assert!(!m.snapshot().can_start);
+        assert!(!m.snapshot().can_deploy);
+        assert!(!m.snapshot().can_repair);
+        assert!(m.snapshot().can_check);
+    }
+    #[test]
+    fn cancellation_and_new_tasks_reject_late_progress() {
+        let mut m = ready();
+        let (old, cancel) = m.begin(Operation::Start).unwrap();
+        m.publish(old, SplashUpdate::loading("first", "", 85));
+        cancel.store(true, Ordering::SeqCst);
+        m.publish(old, SplashUpdate::loading("late", "", 100));
+        assert_eq!(m.view.progress.as_ref().unwrap().title, "first");
+        m.finish(old, Err(anyhow!("cancelled")));
+        let (new, _) = m.begin(Operation::Repair).unwrap();
+        m.publish(old, SplashUpdate::loading("old", "", 100));
+        m.publish(new, SplashUpdate::loading("repair", "", 5));
+        assert_eq!(m.view.progress.as_ref().unwrap().progress, 5.0);
+    }
+    #[test]
+    fn stale_completion_cannot_finish_the_next_task() {
+        let mut m = ready();
+        let (old, _) = m.begin(Operation::Start).unwrap();
+        m.finish(old, Err(anyhow!("failed")));
+        let (new, _) = m.begin(Operation::Start).unwrap();
+        m.finish(old, Ok(()));
+        assert!(m.active);
+        assert_eq!(m.view.task_id, new);
+    }
+
+    #[test]
+    fn stopped_service_can_start_a_fresh_session() {
+        let mut m = ready();
+        let (first, _) = m.begin(Operation::Start).unwrap();
+        m.view.backend_running = true;
+        m.finish(first, Ok(()));
+        let (stop, _) = m.begin(Operation::Stop).unwrap();
+        m.view.backend_running = false;
+        m.finish(stop, Ok(()));
+        let (next, _) = m.begin(Operation::Start).unwrap();
+        assert!(next > first);
+        assert!(m.view.progress.is_none());
+        assert!(!m.accepts(first));
+    }
+
+    #[test]
+    fn update_replacement_failure_releases_the_exit_barrier() {
+        let mut m = ready();
+        m.active = true;
+        m.committing = true;
+        m.view.task_id = 1;
+        m.finish(1, Err(anyhow!("replacement denied")));
+        assert!(!m.committing);
+        assert!(!m.active);
+        assert_eq!(m.view.phase, Phase::Error);
+    }
+}
