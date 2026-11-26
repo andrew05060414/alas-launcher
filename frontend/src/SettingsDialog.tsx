@@ -11,6 +11,7 @@ import {
   Flash16Regular,
   Globe16Regular,
   Image16Regular,
+  Open16Regular,
   OptionsSpeaker16Regular,
   Play16Regular,
   Power20Regular,
@@ -61,6 +62,8 @@ export const languageOptions = [
   { value: "en", label: "English" },
   { value: "zh-neko", label: "猫娘语 (ฅ'ω'ฅ)" },
 ] as const;
+
+const updateSourceOptions = ["auto", "mirrorchyan", "cnb", "gitcode", "official", "cloudflare", "github"] as const;
 
 type SourceLabel = "download" | "python" | "nodejs" | "pypi" | "auto" | "official" | "cnb" | "github" | "nju" | "ustc" | "npmmirror" | "aliyun" | "astral" | "pypi_name" | "tsinghua" | "tencent" | "huawei";
 const sourceGroups = [
@@ -120,6 +123,10 @@ export function SettingsDialog({
   channelCanaryLabel,
   updateSourceLabel,
   updateSourceLabels,
+  useMirrorChyanLabel,
+  mirrorChyanCdkLabel,
+  mirrorChyanCdkPlaceholder,
+  mirrorChyanWebsiteLabel,
   launchOnStartupLabel,
   autoStartServiceLabel,
   keepWebviewOnTrayLabel,
@@ -160,10 +167,11 @@ export function SettingsDialog({
   channelStableLabel: string;
   channelCanaryLabel: string;
   updateSourceLabel: string;
-  updateSourceLabels: Record<
-    "auto" | "official" | "github" | "cloudflare" | "cnb" | "gitcode",
-    string
-  >;
+  updateSourceLabels: Record<LauncherSettings["updateSource"], string>;
+  useMirrorChyanLabel: string;
+  mirrorChyanCdkLabel: string;
+  mirrorChyanCdkPlaceholder: string;
+  mirrorChyanWebsiteLabel: string;
   launchOnStartupLabel: string;
   autoStartServiceLabel: string;
   keepWebviewOnTrayLabel: string;
@@ -188,6 +196,7 @@ export function SettingsDialog({
   const [colorOpen, setColorOpen] = useState(false);
   const [colorDraft, setColorDraft] = useState(() => new TinyColor(defaultAccentColor).toHsv());
   const [hexDraft, setHexDraft] = useState(defaultAccentColor);
+  const [cdkDraft, setCdkDraft] = useState("");
   useInstantDialog();
   useEffect(() => {
     let disposed = false;
@@ -210,10 +219,16 @@ export function SettingsDialog({
       pythonSource: "auto",
       nodejsSource: "auto",
       pypiSource: "auto",
+      useMirrorChyan: false,
+      mirrorChyanCdk: null,
     };
     void command<LauncherSettings>("settings_get")
       .then((s) => {
-        if (!disposed) setSettings(s ?? fallback);
+        if (!disposed) {
+          const resolved = s ?? fallback;
+          setSettings(resolved);
+          setCdkDraft(resolved.mirrorChyanCdk ?? "");
+        }
       })
       .catch(() => {
         if (!disposed) setSettings(fallback);
@@ -454,17 +469,11 @@ export function SettingsDialog({
                     selectedOptions={[settings.updateSource ?? "auto"]}
                     onOptionSelect={(_e, data) =>
                       void update({
-                        updateSource: (data.optionValue === "official" ||
-                          data.optionValue === "github" ||
-                          data.optionValue === "cloudflare" ||
-                          data.optionValue === "cnb" ||
-                          data.optionValue === "gitcode"
-                          ? data.optionValue
-                          : "auto") as LauncherSettings["updateSource"],
+                        updateSource: updateSourceOptions.find((source) => source === data.optionValue) ?? "auto",
                       })
                     }
                   >
-                    {(["auto", "cnb", "gitcode", "official", "cloudflare", "github"] as const).map((value) => (
+                    {updateSourceOptions.map((value) => (
                       <Option key={value} value={value}>{updateSourceLabels[value]}</Option>
                     ))}
                   </Dropdown>
@@ -473,6 +482,44 @@ export function SettingsDialog({
                   <Switch aria-label={skipUpdateLabel} disabled={saving}
                     checked={settings.skipUpdate}
                     onChange={(_e, data) => void update({ skipUpdate: data.checked })} />
+                </SettingCard>
+                <SettingCard icon={ArrowDownload16Regular} title={useMirrorChyanLabel}>
+                  <Switch aria-label={useMirrorChyanLabel} disabled={saving}
+                    checked={settings.useMirrorChyan}
+                    onChange={(_e, data) => void update({ useMirrorChyan: data.checked })} />
+                </SettingCard>
+                <SettingCard icon={Wrench16Regular} title={mirrorChyanCdkLabel}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <Input
+                      size="small"
+                      type="password"
+                      aria-label={mirrorChyanCdkLabel}
+                      placeholder={mirrorChyanCdkPlaceholder}
+                      value={cdkDraft}
+                      disabled={saving}
+                      onChange={(_e, data) => setCdkDraft(data.value)}
+                    />
+                    <Button
+                      size="small"
+                      aria-label={`${applyLabel} ${mirrorChyanCdkLabel}`}
+                      disabled={saving}
+                      onClick={() =>
+                        void update({
+                          mirrorChyanCdk: cdkDraft.trim() ? cdkDraft.trim() : null,
+                        })
+                      }
+                    >
+                      {applyLabel}
+                    </Button>
+                    <Button
+                      size="small"
+                      appearance="subtle"
+                      icon={<Open16Regular />}
+                      aria-label={mirrorChyanWebsiteLabel}
+                      title={mirrorChyanWebsiteLabel}
+                      onClick={() => void command("settings_open_mirror_chyan").catch((error) => setError(String(error)))}
+                    />
+                  </div>
                 </SettingCard>
                 <div className={styles.settingsGroupTitle}>{sourcesGroupLabel}</div>
                 {sourceGroups.map((group) => {

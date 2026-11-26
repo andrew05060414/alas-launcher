@@ -70,7 +70,7 @@ export interface LauncherSettings {
   audioEnabled: boolean;
   skipUpdate: boolean;
   updateChannel: "stable" | "canary";
-  updateSource: "auto" | "official" | "github" | "cloudflare" | "cnb" | "gitcode";
+  updateSource: "auto" | "official" | "github" | "cloudflare" | "cnb" | "gitcode" | "mirrorchyan";
   language: string | null;
   accentColor: string | null;
   customBackgroundImage: string | null;
@@ -79,6 +79,8 @@ export interface LauncherSettings {
   pythonSource: "auto" | "nju" | "ustc" | "npmmirror" | "aliyun" | "cnb" | "astral";
   nodejsSource: "auto" | "official" | "npmmirror" | "nju";
   pypiSource: "auto" | "pypi" | "tsinghua" | "ustc" | "aliyun" | "tencent" | "huawei" | "nju";
+  useMirrorChyan: boolean;
+  mirrorChyanCdk: string | null;
 }
 export const busy = (s: Snapshot) =>
   [
